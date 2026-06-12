@@ -107,8 +107,13 @@ const char* htmlPage = R"rawliteral(
     </select>
     <button id="setMode">Set Mode</button>
     <div id="result" style="margin-top:8px;color:#006;min-height:18px"></div>
+    <div style="height:8px"></div>
+    <button id="syncTime">Sync From Device</button>
+    <div id="syncResult" style="margin-top:8px;color:#060;min-height:18px"></div>
+    <div style="height:8px"></div>
+    <button id="forceSync">Force Sync from NTP server</button>
+    <div id="forceResult" style="margin-top:8px;color:#060;min-height:18px"></div>
   </div>
-
   <script>
     document.getElementById('setMode').addEventListener('click', function(){
       var m = document.getElementById('mode').value;
@@ -120,6 +125,32 @@ const char* htmlPage = R"rawliteral(
         document.getElementById('result').innerText = 'Error';
       });
     });
+
+    document.getElementById('syncTime').addEventListener('click', function(){
+      var d = new Date();
+      var csv = d.getFullYear()+','+(d.getMonth()+1)+','+d.getDate()+','+d.getHours()+','+d.getMinutes()+','+d.getSeconds()+','+d.getDay();
+      fetch('/sync_time', {
+        method: 'POST',
+        headers: {'Content-Type':'text/plain'},
+        body: csv
+      }).then(function(resp){ return resp.text(); })
+      .then(function(text){ document.getElementById('syncResult').innerText = text; })
+      .catch(function(){ document.getElementById('syncResult').innerText = 'Error'; });
+    });
+
+    // Force Sync handling: enable only when ESP is connected to router
+    var forceBtn = document.getElementById('forceSync');
+    var forceRes = document.getElementById('forceResult');
+    function updateStatus(){
+      fetch('/status').then(function(r){ return r.json(); }).then(function(js){
+        if(js.connected) forceBtn.disabled = false; else forceBtn.disabled = true;
+      }).catch(function(){ forceBtn.disabled = true; });
+    }
+    forceBtn.addEventListener('click', function(){
+      fetch('/force_sync', {method:'POST'}).then(function(r){ return r.text(); }).then(function(t){ forceRes.innerText = t; updateStatus(); }).catch(function(){ forceRes.innerText = 'Error'; });
+    });
+    updateStatus();
+    setInterval(updateStatus, 5000);
   </script>
 
 </body>

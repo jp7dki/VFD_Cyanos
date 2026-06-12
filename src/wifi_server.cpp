@@ -21,6 +21,8 @@ extern SemaphoreHandle_t xWireMutex; // 実体は main.cpp にある
 extern hw_timer_t *bam_timer; // display.h に extern
 extern uint8_t dec2bcd(uint8_t val); // main.cpp に実装
 extern uint8_t displayEffectMode; // main.cpp にある表示モード変数
+// forward declarations
+bool syncNTP();
 
 void handleRoot() {
   extern const char* htmlPage;
@@ -51,6 +53,64 @@ void handleSave() {
   server.send(200, "text/html", "<h2>Saved! Restarting...</h2>");
   delay(1000);
   ESP.restart();
+}
+
+// クライアント側のローカル日時を受け取りRTCへ設定する
+// 受信フォーマット(plain text, CSV): "YYYY,MM,DD,hh,mm,ss,wday"
+// wday: 0-6 (Sun=0)
+void handleSyncTime(){
+  String body = server.arg("plain");
+  if(body.length() == 0){
+    server.send(400, "text/plain", "empty body");
+    return;
+  }
+
+  char buf[128];
+  body.toCharArray(buf, sizeof(buf));
+  int yr=0,mo=0,da=0,hh=0,mi=0,se=0,wd=0;
+  int n = sscanf(buf, "%d,%d,%d,%d,%d,%d,%d", &yr,&mo,&da,&hh,&mi,&se,&wd);
+  if(n < 6){
+    server.send(400, "text/plain", "invalid format");
+    return;
+  }
+
+  rtc_time t;
+  t.bcd.year = dec2bcd((uint8_t)(yr - 2000));
+  t.bcd.month = dec2bcd((uint8_t)mo);
+  t.bcd.day = dec2bcd((uint8_t)da);
+  t.bcd.weekday = 1 << (wd & 0x07);
+  t.bcd.hour = dec2bcd((uint8_t)hh);
+  t.bcd.min = dec2bcd((uint8_t)mi);
+  t.bcd.sec = dec2bcd((uint8_t)se);
+
+  extern SemaphoreHandle_t xWireMutex;
+  if(xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(2000)) == pdTRUE){
+    rx8900_set_time(t);
+    uint8_t ctrl1 = 0;
+    rx8900_read_reg(0x0F, &ctrl1);
+    rx8900_write_reg(0x0F, ctrl1 | 0x01);
+    rx8900_write_reg(0x0F, ctrl1 & ~0x01);
+    xSemaphoreGive(xWireMutex);
+    server.send(200, "text/plain", "RTC updated");
+  } else {
+    server.send(500, "text/plain", "bus busy");
+  }
+}
+
+void handleStatus(){
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  String json = String("{") + "\"connected\":" + (connected?"true":"false") + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleForceSync(){
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "text/plain", "not connected to router");
+    return;
+  }
+  bool ok = syncNTP();
+  if (ok) server.send(200, "text/plain", "NTP sync OK");
+  else server.send(500, "text/plain", "NTP sync failed");
 }
 
 // /mode?mode=<0-4> or /mode?m=<name>
@@ -159,6 +219,9 @@ void WiFiTask(void *pvParameters) {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/mode", HTTP_GET, handleSetMode);
   server.on("/mode", HTTP_POST, handleSetMode);
+  server.on("/sync_time", HTTP_POST, handleSyncTime);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/force_sync", HTTP_POST, handleForceSync);
   server.onNotFound(handleNotFound);
   server.begin();
 
