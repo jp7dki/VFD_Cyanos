@@ -1,0 +1,206 @@
+#include "wifi_server.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <time.h>
+#include <sys/time.h>
+#include "rtc_rx8900.h"
+#include "display.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+DNSServer dnsServer;
+WebServer server(80);
+Preferences preferences;
+
+extern SemaphoreHandle_t xWireMutex; // 実体は main.cpp にある
+extern hw_timer_t *bam_timer; // display.h に extern
+extern uint8_t dec2bcd(uint8_t val); // main.cpp に実装
+extern uint8_t displayEffectMode; // main.cpp にある表示モード変数
+
+void handleRoot() {
+  extern const char* htmlPage;
+  server.send(200, "text/html", htmlPage);
+}
+
+void handleNotFound() {
+  server.sendHeader("Location", String("http://") + apIP.toString(), true);
+  server.send(302, "text/plain", "");
+}
+
+void handleSave() {
+  timerAlarmDisable(bam_timer);
+  digitalWrite(VFD_RCLK_PIN, LOW);
+  SPI.beginTransaction(SPISettings(3000000, MSBFIRST, SPI_MODE0));
+  SPI.transfer(0x00); SPI.transfer(0x00); SPI.transfer(0x00);
+  SPI.endTransaction();
+  digitalWrite(VFD_RCLK_PIN, HIGH);
+
+  String newSSID = server.arg("ssid");
+  String newPass = server.arg("pass");
+
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", newSSID);
+  preferences.putString("pass", newPass);
+  preferences.end();
+
+  server.send(200, "text/html", "<h2>Saved! Restarting...</h2>");
+  delay(1000);
+  ESP.restart();
+}
+
+// /mode?mode=<0-4> or /mode?m=<name>
+void handleSetMode(){
+  String m = server.arg("mode");
+  if(m == "") m = server.arg("m");
+
+  uint8_t newMode = 0xFF;
+  if(m.length() == 0){
+    server.send(400, "text/plain", "mode parameter required");
+    return;
+  }
+
+  // 数字で指定された場合
+  bool isNum = true;
+  for (size_t i=0;i<m.length();i++) if(!isDigit(m[i])) { isNum = false; break; }
+  if(isNum){
+    int v = m.toInt();
+    if(v >=0 && v <=4) newMode = (uint8_t)v;
+  } else {
+    String s = m;
+    s.toLowerCase();
+    if(s == "cut") newMode = 0;
+    else if(s == "crossfade") newMode = 1;
+    else if(s == "fade") newMode = 2;
+    else if(s == "stroke") newMode = 3;
+    else if(s == "roll") newMode = 4;
+  }
+
+  if(newMode == 0xFF){
+    server.send(400, "text/plain", "invalid mode");
+    return;
+  }
+
+  displayEffectMode = newMode;
+  server.send(200, "text/plain", String("mode set to ") + String((int)newMode));
+}
+
+bool syncNTP() {
+  configTime(9 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Waiting for NTP time sync...");
+  struct tm timeinfo;
+  bool syncSuccess = false;
+  for (int i = 0; i < 3; i++) {
+    if (getLocalTime(&timeinfo, 5000)) {
+      syncSuccess = true;
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  if (!syncSuccess) {
+    Serial.println("NTP Sync Failed.");
+    return false;
+  }
+  Serial.println("ESP32 Internal Clock Synced with NTP.");
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  uint32_t current_ms = tv.tv_usec / 1000;
+  uint32_t wait_ms = 1000 - current_ms;
+  vTaskDelay(pdMS_TO_TICKS(wait_ms));
+  time_t now = tv.tv_sec + 1;
+  struct tm *t_exact = localtime(&now);
+
+  rtc_time t;
+  t.bcd.year    = dec2bcd(t_exact->tm_year - 100);
+  t.bcd.month   = dec2bcd(t_exact->tm_mon + 1);
+  t.bcd.day     = dec2bcd(t_exact->tm_mday);
+  t.bcd.weekday = 1 << t_exact->tm_wday;
+  t.bcd.hour    = dec2bcd(t_exact->tm_hour);
+  t.bcd.min     = dec2bcd(t_exact->tm_min);
+  t.bcd.sec     = dec2bcd(t_exact->tm_sec);
+
+  extern SemaphoreHandle_t xWireMutex;
+  if(xSemaphoreTake(xWireMutex, portMAX_DELAY) == pdTRUE) {
+    rx8900_set_time(t);
+    uint8_t ctrl1 = 0;
+    rx8900_read_reg(0x0F, &ctrl1);
+    rx8900_write_reg(0x0F, ctrl1 | 0x01);
+    rx8900_write_reg(0x0F, ctrl1 & ~0x01);
+    xSemaphoreGive(xWireMutex);
+    Serial.printf("RTC Perfectly Synced! Time: %02d:%02d:%02d\n", t_exact->tm_hour, t_exact->tm_min, t_exact->tm_sec);
+    return true;
+  }
+  return false;
+}
+
+// WiFiTask 本体（AP + STA, WebServer, DNS, NTP 管理）
+void WiFiTask(void *pvParameters) {
+  WiFi.persistent(false);
+
+  preferences.begin("wifi", false);
+  String ssid = preferences.getString("ssid", "");
+  String pass = preferences.getString("pass", "");
+  preferences.end();
+
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.mode(WIFI_AP_STA);
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP("VFD_Clock_Setup", "12345678");
+  Serial.println("Access Point Started.");
+
+  dnsServer.start(DNS_PORT, "*", apIP);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/mode", HTTP_GET, handleSetMode);
+  server.on("/mode", HTTP_POST, handleSetMode);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  unsigned long lastSyncMillis = 0;
+  bool forceSync = true;
+  const unsigned long syncIntervalInterval = 86400000UL;
+
+  if (ssid != "") {
+    Serial.printf("Connecting to Router: %s\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  } else {
+    Serial.println("No Router SSID set. Running in AP-Only mode.");
+    forceSync = false;
+  }
+
+  while (1) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+
+    if (ssid != "" && (forceSync || (millis() - lastSyncMillis >= syncIntervalInterval))) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Router connected. Triggering periodic NTP sync...");
+        if (syncNTP()) {
+          lastSyncMillis = millis();
+          forceSync = false;
+        } else {
+          lastSyncMillis = millis() - syncIntervalInterval + 3600000UL;
+          forceSync = false;
+        }
+      } else {
+        static unsigned long lastReconnectAttempt = 0;
+        if (millis() - lastReconnectAttempt > 30000) {
+          Serial.println("Router disconnected. Reconnecting...");
+          WiFi.begin(ssid.c_str(), pass.c_str());
+          lastReconnectAttempt = millis();
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void startWiFiTask(){
+  xTaskCreatePinnedToCore(WiFiTask, "WiFiTask", 1024 * 8, NULL, 2, NULL, 0);
+}
