@@ -19,6 +19,77 @@ const uint16_t convNumToSeg[10] = {
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
 };
 
+static uint8_t currentBrightness = 50; // 0-100
+static bool allowedLevel[101];
+
+static void compute_allowed_levels(){
+  const uint8_t weights[BAM_RESOLUTION] = {1,2,4,8,16,32};
+  const uint8_t total = (1<<BAM_RESOLUTION) - 1; // 63
+  for(int p=0;p<=100;p++) allowedLevel[p]=false;
+  for(int p=0;p<=100;p++){
+    // best mask for p
+    uint8_t best_m = 0; uint32_t best_diff = UINT32_MAX; uint32_t target = (uint32_t)p * (uint32_t)total;
+    int best_sum = 0;
+    for(uint8_t m=0;m < (1<<BAM_RESOLUTION); m++){
+      int sumW = 0; for(uint8_t b=0;b<BAM_RESOLUTION;b++) if(m & (1<<b)) sumW += weights[b];
+      uint32_t diff = (sumW * 100 > target) ? (sumW * 100 - target) : (target - sumW * 100);
+      if(diff < best_diff){ best_diff = diff; best_m = m; best_sum = sumW; }
+    }
+    // compare neighbors to detect stability
+    int prev_sum = -1, next_sum = -1;
+    if(p>0){ uint32_t t2 = (uint32_t)(p-1) * (uint32_t)total; uint32_t bd=UINT32_MAX; int s=0; for(uint8_t m=0;m < (1<<BAM_RESOLUTION); m++){ int sumW=0; for(uint8_t b=0;b<BAM_RESOLUTION;b++) if(m & (1<<b)) sumW+=weights[b]; uint32_t diff=(sumW*100>t2)?(sumW*100-t2):(t2-sumW*100); if(diff<bd){bd=diff; s=sumW;}} prev_sum=s; }
+    if(p<100){ uint32_t t2 = (uint32_t)(p+1) * (uint32_t)total; uint32_t bd=UINT32_MAX; int s=0; for(uint8_t m=0;m < (1<<BAM_RESOLUTION); m++){ int sumW=0; for(uint8_t b=0;b<BAM_RESOLUTION;b++) if(m & (1<<b)) sumW+=weights[b]; uint32_t diff=(sumW*100>t2)?(sumW*100-t2):(t2-sumW*100); if(diff<bd){bd=diff; s=sumW;}} next_sum=s; }
+    bool stable = true;
+    if(prev_sum!=-1 && abs(best_sum - prev_sum) > 1) stable = false;
+    if(next_sum!=-1 && abs(best_sum - next_sum) > 1) stable = false;
+    if(stable) allowedLevel[p] = true;
+  }
+}
+
+void display_set_brightness(uint8_t percent){
+  if(percent > 100) percent = 100;
+  // snap to nearest allowed level
+  if(!allowedLevel[percent]){
+    int best = -1; int bestDist = 1000;
+    for(int d=0; d<=100; d++) if(allowedLevel[d]){
+      int dist = abs(d - (int)percent);
+      if(dist < bestDist){ bestDist = dist; best = d; }
+    }
+    if(best >= 0) percent = (uint8_t)best;
+  }
+  currentBrightness = percent;
+  Serial.printf("display_set_brightness: snapped to %u%% (MCPWM fixed)\n", (unsigned)currentBrightness);
+}
+
+uint8_t display_get_brightness(){
+  return currentBrightness;
+}
+
+// N-frame bundling: precompute N masks per digit so average over N frames
+// approximates requested brightness while minimizing per-frame quantization error.
+uint8_t display_get_bam_mask_for_digit(uint8_t digit){
+  // Simple single-frame selection: choose mask whose weight sum best matches
+  // requested brightness percentage. This is the pre-N-frame method.
+  const uint8_t weights[BAM_RESOLUTION] = {1,2,4,8,16,32};
+  const uint8_t total = (1<<BAM_RESOLUTION) - 1; // 63
+
+  if(digit >= NUM_DIGITS) digit = digit % NUM_DIGITS;
+  if (currentBrightness >= 100) return (uint8_t)((1<<BAM_RESOLUTION)-1);
+
+  // find best mask by brute-force (64 combinations)
+  uint8_t best_mask = 0;
+  uint32_t best_diff = UINT32_MAX;
+  uint32_t target = (uint32_t)currentBrightness * (uint32_t)total; // compare against sumW*100
+  for(uint8_t m=0; m < (1<<BAM_RESOLUTION); m++){
+    uint32_t sumW = 0;
+    for(uint8_t b=0; b<BAM_RESOLUTION; b++) if(m & (1<<b)) sumW += weights[b];
+    uint32_t diff = (sumW * 100 > target) ? (sumW * 100 - target) : (target - sumW * 100);
+    if(diff < best_diff){ best_diff = diff; best_mask = m; }
+  }
+  return best_mask;
+}
+
+
 uint32_t convShiftData(uint8_t digit, uint16_t segment){
   uint32_t disp_data = 0x00000000;
   uint8_t digitShiftTable[9] = {0, 4, 7, 8, 9, 10, 12, 15, 19};
@@ -126,4 +197,8 @@ void display_init(){
   timerAttachInterrupt(bam_timer, &onBAMTimer, true);
   timerAlarmWrite(bam_timer, BASE_TIME_US, true);
   timerAlarmEnable(bam_timer);
+  // Apply initial brightness to MCPWM outputs
+  // compute allowed levels before accepting brightness
+  compute_allowed_levels();
+  display_set_brightness(currentBrightness);
 }

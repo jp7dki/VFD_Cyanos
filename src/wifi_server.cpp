@@ -103,6 +103,27 @@ void handleStatus(){
   server.send(200, "application/json", json);
 }
 
+// Brightness handlers
+void handleGetBrightness(){
+  uint8_t b = display_get_brightness();
+  String json = String("{") + "\"brightness\":" + String((int)b) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetBrightness(){
+  String v = server.arg("value");
+  if(v.length() == 0) v = server.arg("b");
+  if(v.length() == 0){
+    server.send(400, "text/plain", "value required");
+    return;
+  }
+  int val = v.toInt();
+  if(val < 0) val = 0; if(val > 100) val = 100;
+  Serial.printf("handleSetBrightness: request value=%s -> %d\n", v.c_str(), val);
+  display_set_brightness((uint8_t)val);
+  server.send(200, "text/plain", String("brightness=") + String(val));
+}
+
 void handleForceSync(){
   if (WiFi.status() != WL_CONNECTED) {
     server.send(400, "text/plain", "not connected to router");
@@ -219,6 +240,8 @@ void WiFiTask(void *pvParameters) {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/mode", HTTP_GET, handleSetMode);
   server.on("/mode", HTTP_POST, handleSetMode);
+  server.on("/brightness", HTTP_GET, handleGetBrightness);
+  server.on("/brightness", HTTP_POST, handleSetBrightness);
   server.on("/sync_time", HTTP_POST, handleSyncTime);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/force_sync", HTTP_POST, handleForceSync);

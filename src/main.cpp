@@ -105,6 +105,9 @@ const char* htmlPage = R"rawliteral(
       <option value="stroke">Stroke</option>
       <option value="roll">Roll</option>
     </select>
+    <div style="height:8px"></div>
+    <label for="brightness">Brightness <span id="bval">50</span>%</label>
+    <input type="range" id="brightness" min="0" max="100" value="50">
     <button id="setMode">Set Mode</button>
     <div id="result" style="margin-top:8px;color:#006;min-height:18px"></div>
     <div style="height:8px"></div>
@@ -125,6 +128,24 @@ const char* htmlPage = R"rawliteral(
         document.getElementById('result').innerText = 'Error';
       });
     });
+
+    // Brightness slider
+    var brightSlider = document.getElementById('brightness');
+    var bval = document.getElementById('bval');
+    function fetchBrightness(){
+      fetch('/brightness').then(function(r){ return r.json(); }).then(function(js){
+        brightSlider.value = js.brightness; bval.innerText = js.brightness;
+      }).catch(function(){ });
+    }
+    var setTimeoutId = null;
+    brightSlider.addEventListener('input', function(){
+      bval.innerText = brightSlider.value;
+      if(setTimeoutId) clearTimeout(setTimeoutId);
+      setTimeoutId = setTimeout(function(){
+        fetch('/brightness', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'value='+encodeURIComponent(brightSlider.value)}).then(function(r){ return r.text(); }).then(function(t){}).catch(function(){});
+      }, 300);
+    });
+    fetchBrightness();
 
     document.getElementById('syncTime').addEventListener('click', function(){
       var d = new Date();
@@ -218,7 +239,11 @@ void renderDisplay() {
         if (newBright & (1 << bit)) layerData |= newSegs;
       }
       if (layerData > 0) layerData |= digitBit;
-      hiddenBuffer[i][bit] = layerData;
+      // compute per-digit BAM mask once per digit
+      extern uint8_t display_get_bam_mask_for_digit(uint8_t digit);
+      static uint8_t bamMaskPerDigit[NUM_DIGITS] = {0};
+      if (bit == 0) bamMaskPerDigit[i] = display_get_bam_mask_for_digit(i);
+      if (layerData && (bamMaskPerDigit[i] & (1 << bit))) hiddenBuffer[i][bit] = layerData; else hiddenBuffer[i][bit] = 0;
     }
   }
 }
