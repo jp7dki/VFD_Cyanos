@@ -24,15 +24,19 @@ uint32_t totalUptimeHours = 0;
 static Preferences uptimePrefs;
 
 void saveUptimeHours(){
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   uptimePrefs.begin("sys", false);
   uptimePrefs.putUInt("uptime_h", totalUptimeHours);
   uptimePrefs.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 }
 
 void loadUptimeHours(){
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   uptimePrefs.begin("sys", false);
   totalUptimeHours = uptimePrefs.getUInt("uptime_h", 0);
   uptimePrefs.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
   Serial.printf("loadUptimeHours: totalUptimeHours=%u\n", (unsigned)totalUptimeHours);
 }
 
@@ -56,6 +60,7 @@ void UptimeTask(void *pvParameters){
 SemaphoreHandle_t xTimeMutex;
 SemaphoreHandle_t xWireMutex;
 SemaphoreHandle_t xIntMutex;
+SemaphoreHandle_t xPrefsMutex;
 
 enum EffectMode {
   EFFECT_CUT = 0,
@@ -77,9 +82,11 @@ uint8_t fadeState[NUM_DIGITS] = {0};
 // Load persisted display mode from Preferences
 void loadDisplayMode(){
   Preferences p;
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   p.begin("display", true);
   uint32_t m = p.getUInt("mode", (uint32_t)EFFECT_ROLL);
   p.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
   if(m <= 4){
     displayEffectMode = (uint8_t)m;
   }
@@ -348,6 +355,7 @@ void setup() {
   xTimeMutex = xSemaphoreCreateMutex();
   xWireMutex = xSemaphoreCreateMutex();
   xIntMutex = xSemaphoreCreateBinary();
+  xPrefsMutex = xSemaphoreCreateMutex();
 
   // display 初期化を display モジュールに委譲
   display_init();
@@ -393,9 +401,11 @@ void loop() {
   if(displayModeDirty){
     displayModeDirty = false;
     Preferences p;
+    if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
     p.begin("display", false);
     p.putUInt("mode", (uint32_t)displayEffectMode);
     p.end();
+    if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
     Serial.printf("Saved display mode=%u to Preferences\n", (unsigned)displayEffectMode);
   }
   uint16_t targetSegs[NUM_DIGITS] = {0};

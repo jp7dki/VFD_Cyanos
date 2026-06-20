@@ -22,6 +22,7 @@ extern hw_timer_t *bam_timer; // display.h に extern
 extern uint8_t dec2bcd(uint8_t val); // main.cpp に実装
 extern uint8_t displayEffectMode; // main.cpp にある表示モード変数
 extern uint32_t totalUptimeHours; // main.cpp にある累計時間
+extern SemaphoreHandle_t xPrefsMutex; // declared in main.cpp
 // forward declarations
 bool syncNTP();
 
@@ -46,10 +47,13 @@ void handleSave() {
   String newSSID = server.arg("ssid");
   String newPass = server.arg("pass");
 
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("wifi", false);
   preferences.putString("ssid", newSSID);
   preferences.putString("pass", newPass);
   preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+
 
   server.send(200, "text/html", "<h2>Saved! Restarting...</h2>");
   delay(1000);
@@ -176,9 +180,11 @@ void handleSetMode(){
 
   displayEffectMode = newMode;
   // persist display mode to Preferences so it survives power cycles
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("display", false);
   preferences.putUInt("mode", (uint32_t)newMode);
   preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 
   Serial.printf("handleSetMode: saved mode=%u\n", (unsigned)newMode);
   server.send(200, "text/plain", String("mode set to ") + String((int)newMode));
@@ -236,10 +242,12 @@ bool syncNTP() {
 void WiFiTask(void *pvParameters) {
   WiFi.persistent(false);
 
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("wifi", false);
   String ssid = preferences.getString("ssid", "");
   String pass = preferences.getString("pass", "");
   preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.mode(WIFI_AP_STA);
