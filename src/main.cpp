@@ -66,6 +66,7 @@ enum EffectMode {
 };
 
 uint8_t displayEffectMode = EFFECT_ROLL;
+volatile bool displayModeDirty = false;
 
 // クロスフェード管理用変数
 uint16_t currentSegs[NUM_DIGITS]  = {0}; 
@@ -90,11 +91,8 @@ void switch_handler(SwitchId id, bool pressed){
   if(id == SW_B && pressed){
     uint8_t newMode = (displayEffectMode + 1) % 5;
     displayEffectMode = newMode;
-    Preferences p;
-    p.begin("display", false);
-    p.putUInt("mode", (uint32_t)newMode);
-    p.end();
-    Serial.printf("switch_handler: SWB pressed -> mode=%u\n", (unsigned)newMode);
+    displayModeDirty = true; // defer flash write to main loop
+    Serial.printf("switch_handler: SWB pressed -> mode=%u (deferred save)\n", (unsigned)newMode);
   }
 }
 
@@ -391,6 +389,15 @@ void setup() {
 }
 
 void loop() {
+  // Persist display mode if requested by switch handler (deferred to main loop)
+  if(displayModeDirty){
+    displayModeDirty = false;
+    Preferences p;
+    p.begin("display", false);
+    p.putUInt("mode", (uint32_t)displayEffectMode);
+    p.end();
+    Serial.printf("Saved display mode=%u to Preferences\n", (unsigned)displayEffectMode);
+  }
   uint16_t targetSegs[NUM_DIGITS] = {0};
   uint8_t dispNum[NUM_DIGITS] = {0}; // ★追加: 各桁の純粋な数値(0-9)を保持する配列
 
