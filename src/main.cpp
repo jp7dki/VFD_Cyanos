@@ -22,16 +22,20 @@ rtc_time currentTime;
 // Uptime hours (cumulative powered-on hours). Persisted in Preferences.
 uint32_t totalUptimeHours = 0;
 static Preferences uptimePrefs;
+// Prefs queue for serializing NVS writes to a single task
+typedef enum { PREF_SAVE_DISPLAY_MODE = 1, PREF_SAVE_UPTIME = 2 } PrefsCmdType;
+typedef struct { uint8_t cmd; uint32_t value; } PrefsCmd;
+QueueHandle_t prefsQueue = NULL;
 
 // forward declaration for preferences mutex (defined later in file)
 extern SemaphoreHandle_t xPrefsMutex;
 
 void saveUptimeHours(){
-  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
-  uptimePrefs.begin("sys", false);
-  uptimePrefs.putUInt("uptime_h", totalUptimeHours);
-  uptimePrefs.end();
-  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  // enqueue save request for PrefsTask
+  if(prefsQueue){
+    PrefsCmd cmd = { .cmd = PREF_SAVE_UPTIME, .value = totalUptimeHours };
+    xQueueSend(prefsQueue, &cmd, 0);
+  }
 }
 
 void loadUptimeHours(){
@@ -94,6 +98,28 @@ void loadDisplayMode(){
     displayEffectMode = (uint8_t)m;
   }
   Serial.printf("loadDisplayMode: loaded mode=%u\n", (unsigned)displayEffectMode);
+}
+
+// PrefsTask: centralizes NVS writes to avoid concurrent Preferences access
+void PrefsTask(void *pvParameters){
+  (void)pvParameters;
+  Preferences p;
+  PrefsCmd cmd;
+  for(;;){
+    if(xQueueReceive(prefsQueue, &cmd, portMAX_DELAY) == pdTRUE){
+      if(cmd.cmd == PREF_SAVE_DISPLAY_MODE){
+        p.begin("display", false);
+        p.putUInt("mode", (uint32_t)cmd.value);
+        p.end();
+        Serial.printf("PrefsTask: saved display mode=%u\n", (unsigned)cmd.value);
+      } else if(cmd.cmd == PREF_SAVE_UPTIME){
+        p.begin("sys", false);
+        p.putUInt("uptime_h", cmd.value);
+        p.end();
+        Serial.printf("PrefsTask: saved uptime=%u\n", (unsigned)cmd.value);
+      }
+    }
+  }
 }
 
 // Switch handling: SWB cycles display effect mode when pressed.
@@ -359,6 +385,8 @@ void setup() {
   xWireMutex = xSemaphoreCreateMutex();
   xIntMutex = xSemaphoreCreateBinary();
   xPrefsMutex = xSemaphoreCreateMutex();
+  prefsQueue = xQueueCreate(4, sizeof(PrefsCmd));
+  if(prefsQueue) xTaskCreatePinnedToCore(PrefsTask, "PrefsTask", 1024*2, NULL, 3, NULL, 1);
 
   // display 初期化を display モジュールに委譲
   display_init();
@@ -403,13 +431,19 @@ void loop() {
   // Persist display mode if requested by switch handler (deferred to main loop)
   if(displayModeDirty){
     displayModeDirty = false;
-    Preferences p;
-    if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
-    p.begin("display", false);
-    p.putUInt("mode", (uint32_t)displayEffectMode);
-    p.end();
-    if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
-    Serial.printf("Saved display mode=%u to Preferences\n", (unsigned)displayEffectMode);
+    // enqueue save request for PrefsTask; fallback to direct save if queue missing
+    if(prefsQueue){
+      PrefsCmd cmd = { .cmd = PREF_SAVE_DISPLAY_MODE, .value = displayEffectMode };
+      xQueueSend(prefsQueue, &cmd, 0);
+    } else {
+      Preferences p;
+      if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+      p.begin("display", false);
+      p.putUInt("mode", (uint32_t)displayEffectMode);
+      p.end();
+      if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+      Serial.printf("Saved display mode=%u to Preferences\n", (unsigned)displayEffectMode);
+    }
   }
   uint16_t targetSegs[NUM_DIGITS] = {0};
   uint8_t dispNum[NUM_DIGITS] = {0}; // ★追加: 各桁の純粋な数値(0-9)を保持する配列
