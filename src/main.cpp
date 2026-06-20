@@ -85,16 +85,16 @@ void loadDisplayMode(){
   Serial.printf("loadDisplayMode: loaded mode=%u\n", (unsigned)displayEffectMode);
 }
 
-// Switch handling: SWA cycles display effect mode when pressed.
+// Switch handling: SWB cycles display effect mode when pressed.
 void switch_handler(SwitchId id, bool pressed){
-  if(id == SW_A && pressed){
+  if(id == SW_B && pressed){
     uint8_t newMode = (displayEffectMode + 1) % 5;
     displayEffectMode = newMode;
     Preferences p;
     p.begin("display", false);
     p.putUInt("mode", (uint32_t)newMode);
     p.end();
-    Serial.printf("switch_handler: SWA pressed -> mode=%u\n", (unsigned)newMode);
+    Serial.printf("switch_handler: SWB pressed -> mode=%u\n", (unsigned)newMode);
   }
 }
 
@@ -378,9 +378,9 @@ void setup() {
 
   // Register switch callback and decide whether to start WiFi.
   switches_register_callback(switch_handler);
-  // If SWA was held at power-on, do not start WiFi (user requested)
-  if(switches_is_pressed(SW_A)){
-    Serial.println("SWA held at boot - WiFi disabled by user");
+  // If SWB was held at power-on, do not start WiFi (user requested)
+  if(switches_is_pressed(SW_B)){
+    Serial.println("SWB held at boot - WiFi disabled by user");
   } else {
     startWiFiTask();
   }
