@@ -23,6 +23,9 @@ rtc_time currentTime;
 uint32_t totalUptimeHours = 0;
 static Preferences uptimePrefs;
 
+// forward declaration for preferences mutex (defined later in file)
+extern SemaphoreHandle_t xPrefsMutex;
+
 void saveUptimeHours(){
   if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   uptimePrefs.begin("sys", false);
