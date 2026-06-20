@@ -111,14 +111,7 @@ void handleGetUptime(){
   server.send(200, "application/json", json);
 }
 
-// Test endpoint: increment uptime immediately (POST)
-void handleIncUptime(){
-  totalUptimeHours++;
-  // persist
-  extern void saveUptimeHours();
-  saveUptimeHours();
-  server.send(200, "text/plain", String("uptime incremented to ") + String((unsigned)totalUptimeHours));
-}
+// NOTE: /uptime_inc (test-only) handler removed for production builds
 
 // Brightness handlers
 void handleGetBrightness(){
@@ -264,7 +257,6 @@ void WiFiTask(void *pvParameters) {
   server.on("/brightness", HTTP_GET, handleGetBrightness);
   server.on("/brightness", HTTP_POST, handleSetBrightness);
   server.on("/uptime", HTTP_GET, handleGetUptime);
-  server.on("/uptime_inc", HTTP_POST, handleIncUptime);
   server.on("/sync_time", HTTP_POST, handleSyncTime);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/force_sync", HTTP_POST, handleForceSync);
