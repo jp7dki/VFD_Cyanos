@@ -7,6 +7,7 @@
 #include "display.h"
 #include "wifi_server.h"
 #include <Preferences.h>
+#include "switches.h"
 
 // RTC割り込みピン
 #define RTC_INT_PIN 5
@@ -32,6 +33,7 @@ void loadUptimeHours(){
   uptimePrefs.begin("sys", false);
   totalUptimeHours = uptimePrefs.getUInt("uptime_h", 0);
   uptimePrefs.end();
+  Serial.printf("loadUptimeHours: totalUptimeHours=%u\n", (unsigned)totalUptimeHours);
 }
 
 // Load persisted display mode from Preferences
@@ -40,6 +42,7 @@ void loadUptimeHours(){
 
 void UptimeTask(void *pvParameters){
   (void)pvParameters;
+  Serial.println("UptimeTask: started");
   // Wait for one hour intervals from boot: first delay is one hour.
   const TickType_t oneHour = pdMS_TO_TICKS(3600000UL);
   for(;;){
@@ -337,6 +340,8 @@ void setup() {
 
   // display 初期化を display モジュールに委譲
   display_init();
+  // switches (buttons) init
+  switches_init();
 
   pinMode(RTC_INT_PIN, INPUT);
 
