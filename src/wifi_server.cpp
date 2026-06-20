@@ -21,6 +21,7 @@ extern SemaphoreHandle_t xWireMutex; // 実体は main.cpp にある
 extern hw_timer_t *bam_timer; // display.h に extern
 extern uint8_t dec2bcd(uint8_t val); // main.cpp に実装
 extern uint8_t displayEffectMode; // main.cpp にある表示モード変数
+extern uint32_t totalUptimeHours; // main.cpp にある累計時間
 // forward declarations
 bool syncNTP();
 
@@ -103,10 +104,17 @@ void handleStatus(){
   server.send(200, "application/json", json);
 }
 
+// Uptime handler
+void handleGetUptime(){
+  uint32_t h = totalUptimeHours;
+  String json = String("{") + "\"uptime_hours\":" + String((unsigned)h) + "}";
+  server.send(200, "application/json", json);
+}
+
 // Brightness handlers
 void handleGetBrightness(){
-  uint8_t b = display_get_brightness();
-  String json = String("{") + "\"brightness\":" + String((int)b) + "}";
+  // Brightness control removed; always report fixed 100%
+  String json = String("{") + "\"brightness\":10," + "\"percent\":100}";
   server.send(200, "application/json", json);
 }
 
@@ -117,11 +125,9 @@ void handleSetBrightness(){
     server.send(400, "text/plain", "value required");
     return;
   }
-  int val = v.toInt();
-  if(val < 0) val = 0; if(val > 100) val = 100;
-  Serial.printf("handleSetBrightness: request value=%s -> %d\n", v.c_str(), val);
-  display_set_brightness((uint8_t)val);
-  server.send(200, "text/plain", String("brightness=") + String(val));
+  // Brightness control is disabled; inform client
+  Serial.printf("handleSetBrightness: request value=%s -> ignored (fixed at 100%%)\n", v.c_str());
+  server.send(403, "text/plain", "brightness control disabled; fixed at 100%");
 }
 
 void handleForceSync(){
@@ -167,6 +173,12 @@ void handleSetMode(){
   }
 
   displayEffectMode = newMode;
+  // persist display mode to Preferences so it survives power cycles
+  preferences.begin("display", false);
+  preferences.putUInt("mode", (uint32_t)newMode);
+  preferences.end();
+
+  Serial.printf("handleSetMode: saved mode=%u\n", (unsigned)newMode);
   server.send(200, "text/plain", String("mode set to ") + String((int)newMode));
 }
 
@@ -242,6 +254,7 @@ void WiFiTask(void *pvParameters) {
   server.on("/mode", HTTP_POST, handleSetMode);
   server.on("/brightness", HTTP_GET, handleGetBrightness);
   server.on("/brightness", HTTP_POST, handleSetBrightness);
+  server.on("/uptime", HTTP_GET, handleGetUptime);
   server.on("/sync_time", HTTP_POST, handleSyncTime);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/force_sync", HTTP_POST, handleForceSync);

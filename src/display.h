@@ -31,7 +31,10 @@ extern const uint16_t convNumToSeg[10];
 void display_init();
 uint32_t convShiftData(uint8_t digit, uint16_t segment);
 void updateDisplay();
-void display_set_brightness(uint8_t percent);
+// Set brightness as percent (0-100). Returns true if exact level applied,
+// false if snapped to a nearest allowed level.
+bool display_set_brightness(uint8_t percent);
 uint8_t display_get_brightness();
 uint8_t display_get_bam_mask_for_digit(uint8_t digit);
+uint8_t display_get_bam_mask_for_percent(uint8_t percent);
  

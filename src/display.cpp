@@ -19,7 +19,7 @@ const uint16_t convNumToSeg[10] = {
   0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
 };
 
-static uint8_t currentBrightness = 50; // 0-100
+static uint8_t currentBrightness = 100; // fixed at 100% (0-100)
 static bool allowedLevel[101];
 
 static void compute_allowed_levels(){
@@ -46,19 +46,17 @@ static void compute_allowed_levels(){
   }
 }
 
-void display_set_brightness(uint8_t percent){
-  if(percent > 100) percent = 100;
-  // snap to nearest allowed level
-  if(!allowedLevel[percent]){
-    int best = -1; int bestDist = 1000;
-    for(int d=0; d<=100; d++) if(allowedLevel[d]){
-      int dist = abs(d - (int)percent);
-      if(dist < bestDist){ bestDist = dist; best = d; }
-    }
-    if(best >= 0) percent = (uint8_t)best;
-  }
-  currentBrightness = percent;
-  Serial.printf("display_set_brightness: snapped to %u%% (MCPWM fixed)\n", (unsigned)currentBrightness);
+bool display_set_brightness(uint8_t percent){
+  // Brightness control disabled: keep at 100% always.
+  (void)percent;
+  currentBrightness = 100;
+  // ensure PWM outputs are set to full duty
+  mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, 100.0f);
+  mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_B, 100.0f);
+  mcpwm_set_duty_type(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, MCPWM_DUTY_MODE_0);
+  mcpwm_set_duty_type(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_B, MCPWM_DUTY_MODE_0);
+  Serial.println("display_set_brightness: disabled, fixed at 100%");
+  return true;
 }
 
 uint8_t display_get_brightness(){
@@ -76,17 +74,24 @@ uint8_t display_get_bam_mask_for_digit(uint8_t digit){
   if(digit >= NUM_DIGITS) digit = digit % NUM_DIGITS;
   if (currentBrightness >= 100) return (uint8_t)((1<<BAM_RESOLUTION)-1);
 
-  // find best mask by brute-force (64 combinations)
-  uint8_t best_mask = 0;
-  uint32_t best_diff = UINT32_MAX;
-  uint32_t target = (uint32_t)currentBrightness * (uint32_t)total; // compare against sumW*100
-  for(uint8_t m=0; m < (1<<BAM_RESOLUTION); m++){
-    uint32_t sumW = 0;
-    for(uint8_t b=0; b<BAM_RESOLUTION; b++) if(m & (1<<b)) sumW += weights[b];
-    uint32_t diff = (sumW * 100 > target) ? (sumW * 100 - target) : (target - sumW * 100);
-    if(diff < best_diff){ best_diff = diff; best_mask = m; }
-  }
-  return best_mask;
+  // Use direct binary representation of desired summed weight to produce
+  // a monotonic mask. This avoids masks flipping between near-equal combos
+  // that cause visible flicker during small changes.
+  uint32_t target_sum = (uint32_t)currentBrightness * (uint32_t)total;
+  // target_sum is percent*total, divide by 100 with rounding
+  uint8_t desired = (uint8_t)((target_sum + 50) / 100);
+  if(desired > total) desired = total;
+  return desired; // desired interpreted as bitmask since weights are powers of two
+}
+
+// Compute a BAM mask for an arbitrary brightness percentage (0-100).
+uint8_t display_get_bam_mask_for_percent(uint8_t percent){
+  if(percent >= 100) return (uint8_t)((1<<BAM_RESOLUTION)-1);
+  const uint8_t total = (1<<BAM_RESOLUTION) - 1; // 63
+  uint32_t target_sum = (uint32_t)percent * (uint32_t)total;
+  uint8_t desired = (uint8_t)((target_sum + 50) / 100);
+  if(desired > total) desired = total;
+  return desired;
 }
 
 

@@ -6,6 +6,7 @@
 #include "freertos/semphr.h"
 #include "display.h"
 #include "wifi_server.h"
+#include <Preferences.h>
 
 // RTC割り込みピン
 #define RTC_INT_PIN 5
@@ -16,6 +17,38 @@ uint16_t lastTargetSegs[NUM_DIGITS] = {0};
 uint64_t dispCount = 0;
 TaskHandle_t ClockTaskHandle = NULL;
 rtc_time currentTime;
+
+// Uptime hours (cumulative powered-on hours). Persisted in Preferences.
+uint32_t totalUptimeHours = 0;
+static Preferences uptimePrefs;
+
+void saveUptimeHours(){
+  uptimePrefs.begin("sys", false);
+  uptimePrefs.putUInt("uptime_h", totalUptimeHours);
+  uptimePrefs.end();
+}
+
+void loadUptimeHours(){
+  uptimePrefs.begin("sys", false);
+  totalUptimeHours = uptimePrefs.getUInt("uptime_h", 0);
+  uptimePrefs.end();
+}
+
+// Load persisted display mode from Preferences
+  // Load persisted display mode from Preferences
+  // (moved below to be after EffectMode/displayEffectMode declaration)
+
+void UptimeTask(void *pvParameters){
+  (void)pvParameters;
+  // Wait for one hour intervals from boot: first delay is one hour.
+  const TickType_t oneHour = pdMS_TO_TICKS(3600000UL);
+  for(;;){
+    vTaskDelay(oneHour);
+    totalUptimeHours++;
+    saveUptimeHours();
+    Serial.printf("UptimeTask: incremented totalUptimeHours=%u\n", (unsigned)totalUptimeHours);
+  }
+}
 
 SemaphoreHandle_t xTimeMutex;
 SemaphoreHandle_t xWireMutex;
@@ -36,6 +69,18 @@ uint16_t currentSegs[NUM_DIGITS]  = {0};
 uint16_t previousSegs[NUM_DIGITS] = {0}; 
 uint8_t  fadeSteps[NUM_DIGITS]    = {50, 50, 50, 50, 50, 50, 50, 50, 50}; 
 uint8_t fadeState[NUM_DIGITS] = {0};
+
+// Load persisted display mode from Preferences
+void loadDisplayMode(){
+  Preferences p;
+  p.begin("display", true);
+  uint32_t m = p.getUInt("mode", (uint32_t)EFFECT_ROLL);
+  p.end();
+  if(m <= 4){
+    displayEffectMode = (uint8_t)m;
+  }
+  Serial.printf("loadDisplayMode: loaded mode=%u\n", (unsigned)displayEffectMode);
+}
 
 // ===== 追加: 7セグメントの書き順定義テーブル =====
 // A=0x01, B=0x02, C=0x04, D=0x08, E=0x10, F=0x20, G=0x40
@@ -74,12 +119,17 @@ const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body{font-family:sans-serif; text-align:center; margin:20px;}
-    .card{display:inline-block; text-align:left; padding:16px; border:1px solid #ddd; border-radius:8px;}
-    input, select, button{margin:8px 0; padding:8px; font-size:14px; width:100%;}
+    /* Unified card width and centered layout for consistent appearance */
+    .card{display:block; text-align:left; padding:16px; border:1px solid #ddd; border-radius:8px; max-width:520px; margin:0 auto 16px auto;}
+    input, select, button{margin:8px 0; padding:8px; font-size:14px; width:100%; box-sizing:border-box}
     h2{margin:0 0 12px 0}
+    /* Slightly larger primary button look */
+    button{background:#f0f0f0;border:0;border-radius:6px}
+    button.primary{background:#007bff;color:#fff;padding:12px}
   </style>
   <title>VFD Clock Setup</title>
 </head>
@@ -106,10 +156,9 @@ const char* htmlPage = R"rawliteral(
       <option value="roll">Roll</option>
     </select>
     <div style="height:8px"></div>
-    <label for="brightness">Brightness <span id="bval">50</span>%</label>
-    <input type="range" id="brightness" min="0" max="100" value="50">
     <button id="setMode">Set Mode</button>
     <div id="result" style="margin-top:8px;color:#006;min-height:18px"></div>
+    <div id="uptime" style="margin-top:8px;color:#060;min-height:18px">Uptime hours: -</div>
     <div style="height:8px"></div>
     <button id="syncTime">Sync From Device</button>
     <div id="syncResult" style="margin-top:8px;color:#060;min-height:18px"></div>
@@ -129,23 +178,7 @@ const char* htmlPage = R"rawliteral(
       });
     });
 
-    // Brightness slider
-    var brightSlider = document.getElementById('brightness');
-    var bval = document.getElementById('bval');
-    function fetchBrightness(){
-      fetch('/brightness').then(function(r){ return r.json(); }).then(function(js){
-        brightSlider.value = js.brightness; bval.innerText = js.brightness;
-      }).catch(function(){ });
-    }
-    var setTimeoutId = null;
-    brightSlider.addEventListener('input', function(){
-      bval.innerText = brightSlider.value;
-      if(setTimeoutId) clearTimeout(setTimeoutId);
-      setTimeoutId = setTimeout(function(){
-        fetch('/brightness', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'value='+encodeURIComponent(brightSlider.value)}).then(function(r){ return r.text(); }).then(function(t){}).catch(function(){});
-      }, 300);
-    });
-    fetchBrightness();
+    // Brightness control removed; display fixed at 100%
 
     document.getElementById('syncTime').addEventListener('click', function(){
       var d = new Date();
@@ -172,6 +205,14 @@ const char* htmlPage = R"rawliteral(
     });
     updateStatus();
     setInterval(updateStatus, 5000);
+    // Uptime fetcher: update uptime hours display every minute
+    function fetchUptime(){
+      fetch('/uptime').then(function(r){ return r.json(); }).then(function(js){
+        var el = document.getElementById('uptime'); if(el) el.innerText = 'Uptime hours: ' + js.uptime_hours + ' h';
+      }).catch(function(){});
+    }
+    setInterval(fetchUptime, 60000);
+    fetchUptime();
   </script>
 
 </body>
@@ -187,6 +228,9 @@ void renderDisplay() {
 
   // hiddenBuffer を直接操作するため、一旦ゼロクリア
   memset((void*)hiddenBuffer, 0, sizeof(bamBufferA));
+
+  // global brightness percent (0-100) applied to all effects
+  uint8_t globalPct = display_get_brightness();
 
   for (uint8_t i = 0; i < NUM_DIGITS; i++) {
     uint8_t newBright = 0;
@@ -220,6 +264,13 @@ void renderDisplay() {
         break;
     }
 
+    // apply global brightness scaling
+    if (globalPct < 100) {
+      float scale = (float)globalPct / 100.0f;
+      newBright = (uint8_t)((float)newBright * scale + 0.5f);
+      oldBright = (uint8_t)((float)oldBright * scale + 0.5f);
+    }
+
     uint32_t digitBit = convShiftData(i, 0);
     uint32_t oldSegs = convShiftData(i, previousSegs[i]) & ~digitBit;
     uint32_t newSegs = convShiftData(i, currentSegs[i]) & ~digitBit;
@@ -228,22 +279,29 @@ void renderDisplay() {
     uint32_t fadeOutSegs = oldSegs & ~newSegs;
     uint32_t fadeInSegs  = newSegs & ~oldSegs;
 
+    // Compute per-digit BAM masks from logical brightness levels
+    extern uint8_t display_get_bam_mask_for_percent(uint8_t percent);
+    uint8_t maskNew = display_get_bam_mask_for_percent((uint8_t)((newBright * 100) / MAX_BRIGHT));
+    uint8_t maskOld = display_get_bam_mask_for_percent((uint8_t)((oldBright * 100) / MAX_BRIGHT));
+    // Use union for common mask to avoid turning off bits that differ between
+    // mask encodings for old/new brightness — prevents disappearing segments
+    uint8_t maskCommon = maskOld | maskNew;
+
+    uint8_t globalMask = display_get_bam_mask_for_percent(globalPct);
     for (int bit = 0; bit < BAM_RESOLUTION; bit++) {
       uint32_t layerData = 0;
       if (displayEffectMode == EFFECT_CROSSFADE) {
-        if (MAX_BRIGHT & (1 << bit)) layerData |= commonSegs;
-        if (oldBright  & (1 << bit)) layerData |= fadeOutSegs;
-        if (newBright  & (1 << bit)) layerData |= fadeInSegs;
+        if (maskCommon & (1 << bit)) layerData |= commonSegs;
+        if (maskOld    & (1 << bit)) layerData |= fadeOutSegs;
+        if (maskNew    & (1 << bit)) layerData |= fadeInSegs;
       } else {
-        if (oldBright & (1 << bit)) layerData |= oldSegs;
-        if (newBright & (1 << bit)) layerData |= newSegs;
+        if (maskOld & (1 << bit)) layerData |= oldSegs;
+        if (maskNew & (1 << bit)) layerData |= newSegs;
       }
-      if (layerData > 0) layerData |= digitBit;
-      // compute per-digit BAM mask once per digit
-      extern uint8_t display_get_bam_mask_for_digit(uint8_t digit);
-      static uint8_t bamMaskPerDigit[NUM_DIGITS] = {0};
-      if (bit == 0) bamMaskPerDigit[i] = display_get_bam_mask_for_digit(i);
-      if (layerData && (bamMaskPerDigit[i] & (1 << bit))) hiddenBuffer[i][bit] = layerData; else hiddenBuffer[i][bit] = 0;
+      if (layerData) layerData |= digitBit;
+      // Gate with global brightness mask so 0% forces display off regardless of MCPWM
+      if (!(globalMask & (1 << bit))) layerData = 0;
+      hiddenBuffer[i][bit] = layerData;
     }
   }
 }
@@ -294,10 +352,16 @@ void setup() {
     rx8900_set_time(currentTime);
   }
   rx8900_get_time(&currentTime);
+  // load saved display mode before starting tasks so UI and rendering use it
+  loadDisplayMode();
 
   xTaskCreatePinnedToCore(ClockTask, "ClockTask", 1024*2, NULL, 5, &ClockTaskHandle, 1);
   attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), handleRtcInterrupt, FALLING);
   startWiFiTask();
+
+  // load persisted uptime hours and start uptime task
+  loadUptimeHours();
+  xTaskCreatePinnedToCore(UptimeTask, "UptimeTask", 1024*1, NULL, 1, NULL, 1);
 }
 
 void loop() {
@@ -305,15 +369,15 @@ void loop() {
   uint8_t dispNum[NUM_DIGITS] = {0}; // ★追加: 各桁の純粋な数値(0-9)を保持する配列
 
   // 各桁の数値を分解して代入
-  dispNum[8] = 0; targetSegs[8] = 0x00;
-  dispNum[7] = currentTime.separate.sec1;  targetSegs[7] = convNumToSeg[dispNum[7]];
-  dispNum[6] = currentTime.separate.sec2;  targetSegs[6] = convNumToSeg[dispNum[6]];
-  dispNum[5] = currentTime.separate.min1;  targetSegs[5] = convNumToSeg[dispNum[5]] | SEG_DOT;
-  dispNum[4] = currentTime.separate.min2;  targetSegs[4] = convNumToSeg[dispNum[4]];
-  dispNum[3] = currentTime.separate.hour1; targetSegs[3] = convNumToSeg[dispNum[3]] | SEG_DOT;
-  dispNum[2] = currentTime.separate.hour2; targetSegs[2] = convNumToSeg[dispNum[2]];
-  dispNum[1] = 0; targetSegs[1] = 0x00;
-  dispNum[0] = 0; targetSegs[0] = 0x00;
+  dispNum[8] = currentTime.separate.sec1;  targetSegs[8] = convNumToSeg[dispNum[8]];
+  dispNum[7] = currentTime.separate.sec2;  targetSegs[7] = convNumToSeg[dispNum[7]];
+  dispNum[6] = currentTime.separate.min1;  targetSegs[6] = convNumToSeg[dispNum[6]] | SEG_DOT;
+  dispNum[5] = currentTime.separate.min2;  targetSegs[5] = convNumToSeg[dispNum[5]];
+  dispNum[4] = currentTime.separate.hour1; targetSegs[4] = convNumToSeg[dispNum[4]] | SEG_DOT;
+  dispNum[3] = currentTime.separate.hour2; targetSegs[3] = convNumToSeg[dispNum[3]];
+  dispNum[2] = 0; targetSegs[2] = 0x00;
+  dispNum[1] = currentTime.separate.day1;  targetSegs[1] = convNumToSeg[dispNum[1]];
+  dispNum[0] = currentTime.separate.day2;  targetSegs[0] = convNumToSeg[dispNum[0]];
 
   // 1. 値が変化した時のトリガー処理
   for (uint8_t i = 0; i < NUM_DIGITS; i++) {
