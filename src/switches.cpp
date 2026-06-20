@@ -60,3 +60,8 @@ void switches_init(){
   }
   xTaskCreatePinnedToCore(SwitchTask, "SwitchTask", 1024, NULL, 1, NULL, 1);
 }
+
+bool switches_is_pressed(SwitchId id){
+  if((int)id < 0 || (int)id >= 3) return false;
+  return stable_state[(int)id];
+}

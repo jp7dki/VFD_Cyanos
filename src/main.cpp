@@ -85,6 +85,19 @@ void loadDisplayMode(){
   Serial.printf("loadDisplayMode: loaded mode=%u\n", (unsigned)displayEffectMode);
 }
 
+// Switch handling: SWA cycles display effect mode when pressed.
+void switch_handler(SwitchId id, bool pressed){
+  if(id == SW_A && pressed){
+    uint8_t newMode = (displayEffectMode + 1) % 5;
+    displayEffectMode = newMode;
+    Preferences p;
+    p.begin("display", false);
+    p.putUInt("mode", (uint32_t)newMode);
+    p.end();
+    Serial.printf("switch_handler: SWA pressed -> mode=%u\n", (unsigned)newMode);
+  }
+}
+
 // ===== 追加: 7セグメントの書き順定義テーブル =====
 // A=0x01, B=0x02, C=0x04, D=0x08, E=0x10, F=0x20, G=0x40
 const uint8_t strokeOrder[10][7] = {
@@ -362,7 +375,15 @@ void setup() {
 
   xTaskCreatePinnedToCore(ClockTask, "ClockTask", 1024*2, NULL, 5, &ClockTaskHandle, 1);
   attachInterrupt(digitalPinToInterrupt(RTC_INT_PIN), handleRtcInterrupt, FALLING);
-  startWiFiTask();
+
+  // Register switch callback and decide whether to start WiFi.
+  switches_register_callback(switch_handler);
+  // If SWA was held at power-on, do not start WiFi (user requested)
+  if(switches_is_pressed(SW_A)){
+    Serial.println("SWA held at boot - WiFi disabled by user");
+  } else {
+    startWiFiTask();
+  }
 
   // load persisted uptime hours and start uptime task
   loadUptimeHours();
