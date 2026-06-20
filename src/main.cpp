@@ -34,7 +34,8 @@ void saveUptimeHours(){
   // enqueue save request for PrefsTask
   if(prefsQueue){
     PrefsCmd cmd = { .cmd = PREF_SAVE_UPTIME, .value = totalUptimeHours };
-    xQueueSend(prefsQueue, &cmd, 0);
+    BaseType_t r = xQueueSend(prefsQueue, &cmd, 0);
+    if(r != pdTRUE) Serial.println("Warning: prefsQueue send failed (uptime)");
   }
 }
 
@@ -111,12 +112,12 @@ void PrefsTask(void *pvParameters){
         p.begin("display", false);
         p.putUInt("mode", (uint32_t)cmd.value);
         p.end();
-        Serial.printf("PrefsTask: saved display mode=%u\n", (unsigned)cmd.value);
+        Serial.println("PrefsTask: saved display mode");
       } else if(cmd.cmd == PREF_SAVE_UPTIME){
         p.begin("sys", false);
         p.putUInt("uptime_h", cmd.value);
         p.end();
-        Serial.printf("PrefsTask: saved uptime=%u\n", (unsigned)cmd.value);
+        Serial.println("PrefsTask: saved uptime");
       }
     }
   }
@@ -385,8 +386,8 @@ void setup() {
   xWireMutex = xSemaphoreCreateMutex();
   xIntMutex = xSemaphoreCreateBinary();
   xPrefsMutex = xSemaphoreCreateMutex();
-  prefsQueue = xQueueCreate(4, sizeof(PrefsCmd));
-  if(prefsQueue) xTaskCreatePinnedToCore(PrefsTask, "PrefsTask", 1024*2, NULL, 3, NULL, 1);
+  prefsQueue = xQueueCreate(8, sizeof(PrefsCmd));
+  if(prefsQueue) xTaskCreatePinnedToCore(PrefsTask, "PrefsTask", 1024*8, NULL, 3, NULL, 1);
 
   // display 初期化を display モジュールに委譲
   display_init();
@@ -434,7 +435,8 @@ void loop() {
     // enqueue save request for PrefsTask; fallback to direct save if queue missing
     if(prefsQueue){
       PrefsCmd cmd = { .cmd = PREF_SAVE_DISPLAY_MODE, .value = displayEffectMode };
-      xQueueSend(prefsQueue, &cmd, 0);
+      BaseType_t r = xQueueSend(prefsQueue, &cmd, 0);
+      if(r != pdTRUE) Serial.println("Warning: prefsQueue send failed (display mode)");
     } else {
       Preferences p;
       if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
