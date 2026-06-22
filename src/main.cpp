@@ -198,6 +198,7 @@ const char* htmlPage = R"rawliteral(
     <form action="/save" method="POST">
       <input name="ssid" placeholder="WiFi SSID" required>
       <input type="password" name="pass" placeholder="Password">
+      <input name="ntp" placeholder="NTP servers (comma separated)">
       <button type="submit">Save & Restart</button>
     </form>
   </div>
@@ -302,6 +303,16 @@ const char* htmlPage = R"rawliteral(
     }
     setInterval(fetchUptime, 60000);
     fetchUptime();
+
+    // Prefill NTP input with current setting
+    fetch('/ntp').then(function(r){ return r.json(); }).then(function(js){
+      try{
+        if(js.ntp){
+          var el = document.querySelector('input[name="ntp"]');
+          if(el) el.value = js.ntp;
+        }
+      }catch(e){}
+    }).catch(function(){});
   </script>
 
 </body>
