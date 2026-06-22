@@ -18,9 +18,11 @@ uint16_t lastTargetSegs[NUM_DIGITS] = {0};
 uint64_t dispCount = 0;
 TaskHandle_t ClockTaskHandle = NULL;
 rtc_time currentTime;
+// 起動時に RTC の値を正常に読み込めたか（true=読み込み成功）
+bool rtc_boot_ok = false;
 
 // Uptime hours (cumulative powered-on hours). Persisted in Preferences.
-uint32_t totalUptimeHours = 0;
+volatile uint32_t totalUptimeHours = 0;
 static Preferences uptimePrefs;
 // Prefs queue for serializing NVS writes to a single task
 typedef enum { PREF_SAVE_DISPLAY_MODE = 1, PREF_SAVE_UPTIME = 2 } PrefsCmdType;
@@ -33,7 +35,7 @@ extern SemaphoreHandle_t xPrefsMutex;
 void saveUptimeHours(){
   // enqueue save request for PrefsTask
   if(prefsQueue){
-    PrefsCmd cmd = { .cmd = PREF_SAVE_UPTIME, .value = totalUptimeHours };
+    PrefsCmd cmd = { .cmd = PREF_SAVE_UPTIME, .value = __atomic_load_n(&totalUptimeHours, __ATOMIC_SEQ_CST) };
     BaseType_t r = xQueueSend(prefsQueue, &cmd, 0);
     if(r != pdTRUE) Serial.println("Warning: prefsQueue send failed (uptime)");
   }
@@ -59,7 +61,7 @@ void UptimeTask(void *pvParameters){
   const TickType_t oneHour = pdMS_TO_TICKS(3600000UL);
   for(;;){
     vTaskDelay(oneHour);
-    totalUptimeHours++;
+    __atomic_add_fetch(&totalUptimeHours, 1, __ATOMIC_SEQ_CST);
     saveUptimeHours();
     Serial.printf("UptimeTask: incremented totalUptimeHours=%u\n", (unsigned)totalUptimeHours);
   }
@@ -80,6 +82,8 @@ enum EffectMode {
 
 uint8_t displayEffectMode = EFFECT_ROLL;
 volatile bool displayModeDirty = false;
+// If true, show Month(2)-Day(2)-space-Hour(2)-Min(2) layout instead of default
+bool displayShowMDHM = false;
 
 // クロスフェード管理用変数
 uint16_t currentSegs[NUM_DIGITS]  = {0}; 
@@ -130,6 +134,10 @@ void switch_handler(SwitchId id, bool pressed){
     displayEffectMode = newMode;
     displayModeDirty = true; // defer flash write to main loop
     Serial.printf("switch_handler: SWB pressed -> mode=%u (deferred save)\n", (unsigned)newMode);
+  } else if(id == SW_C && pressed){
+    // Toggle alternate display: Month(2) Day(2) <space> Hour(2) Min(2)
+    displayShowMDHM = !displayShowMDHM;
+    Serial.printf("switch_handler: SWC pressed -> displayShowMDHM=%d\n", (int)displayShowMDHM);
   }
 }
 
@@ -217,6 +225,15 @@ const char* htmlPage = R"rawliteral(
     <button id="forceSync">Force Sync from NTP server</button>
     <div id="forceResult" style="margin-top:8px;color:#060;min-height:18px"></div>
   </div>
+  
+    <div class="card">
+      <h2>Device Status</h2>
+      <div id="statusConnected" style="margin-bottom:6px">Connected: -</div>
+      <div id="statusIP" style="margin-bottom:6px">IP: -</div>
+      <div id="statusAPClients" style="margin-bottom:6px">AP clients: -</div>
+      <div id="statusLastSync" style="margin-bottom:6px">Last sync: -</div>
+      <div id="statusRtcOk" style="margin-bottom:6px">RTC boot read OK: -</div>
+    </div>
   <script>
     document.getElementById('setMode').addEventListener('click', function(){
       var m = document.getElementById('mode').value;
@@ -248,8 +265,29 @@ const char* htmlPage = R"rawliteral(
     var forceRes = document.getElementById('forceResult');
     function updateStatus(){
       fetch('/status').then(function(r){ return r.json(); }).then(function(js){
-        if(js.connected) forceBtn.disabled = false; else forceBtn.disabled = true;
-      }).catch(function(){ forceBtn.disabled = true; });
+        if(js.connected) {
+          forceBtn.disabled = false;
+          document.getElementById('statusConnected').innerText = 'Connected: Yes';
+        } else {
+          forceBtn.disabled = true;
+          document.getElementById('statusConnected').innerText = 'Connected: No';
+        }
+        // IP (device as STA)
+        document.getElementById('statusIP').innerText = 'IP: ' + (js.ip? js.ip : '-');
+        document.getElementById('statusAPClients').innerText = 'AP clients: ' + (typeof js.ap_clients !== 'undefined' ? js.ap_clients : '-');
+        // last_sync is epoch seconds (0 means never)
+        if(js.last_sync && js.last_sync > 0){
+          var d = new Date(js.last_sync * 1000);
+          document.getElementById('statusLastSync').innerText = 'Last sync: ' + d.toLocaleString();
+        } else {
+          document.getElementById('statusLastSync').innerText = 'Last sync: -';
+        }
+        document.getElementById('statusRtcOk').innerText = 'RTC boot read OK: ' + (js.rtc_ok? 'Yes' : 'No');
+      }).catch(function(){
+        forceBtn.disabled = true;
+        document.getElementById('statusConnected').innerText = 'Connected: ?';
+        document.getElementById('statusIP').innerText = 'IP: ?';
+      });
     }
     forceBtn.addEventListener('click', function(){
       fetch('/force_sync', {method:'POST'}).then(function(r){ return r.text(); }).then(function(t){ forceRes.innerText = t; updateStatus(); }).catch(function(){ forceRes.innerText = 'Error'; });
@@ -407,7 +445,9 @@ void setup() {
     currentTime.bcd.sec = 0;
     rx8900_set_time(currentTime);
   }
-  rx8900_get_time(&currentTime);
+  // 起動時の読み取り結果をフラグに保持
+  int r = rx8900_get_time(&currentTime);
+  rtc_boot_ok = (r == 0);
   // load saved display mode before starting tasks so UI and rendering use it
   loadDisplayMode();
 
@@ -417,7 +457,8 @@ void setup() {
   // Register switch callback and decide whether to start WiFi.
   switches_register_callback(switch_handler);
   // If SWB was held at power-on, do not start WiFi (user requested)
-  if(switches_is_pressed(SW_B)){
+  // Use immediate raw read to detect a button held during power-on.
+  if(switches_was_held_at_boot(SW_B)){
     Serial.println("SWB held at boot - WiFi disabled by user");
   } else {
     startWiFiTask();
@@ -425,7 +466,8 @@ void setup() {
 
   // load persisted uptime hours and start uptime task
   loadUptimeHours();
-  xTaskCreatePinnedToCore(UptimeTask, "UptimeTask", 1024*1, NULL, 1, NULL, 1);
+  // Increase stack for UptimeTask to avoid overflow during NVS/Preferences operations
+  xTaskCreatePinnedToCore(UptimeTask, "UptimeTask", 1024*2, NULL, 1, NULL, 1);
 }
 
 void loop() {
@@ -451,20 +493,36 @@ void loop() {
   uint8_t dispNum[NUM_DIGITS] = {0}; // ★追加: 各桁の純粋な数値(0-9)を保持する配列
 
   // 各桁の数値を分解して代入
-  dispNum[8] = currentTime.separate.sec1;  targetSegs[8] = convNumToSeg[dispNum[8]];
-  dispNum[7] = currentTime.separate.sec2;  targetSegs[7] = convNumToSeg[dispNum[7]];
-  dispNum[6] = currentTime.separate.min1;  targetSegs[6] = convNumToSeg[dispNum[6]] | SEG_DOT;
-  dispNum[5] = currentTime.separate.min2;  targetSegs[5] = convNumToSeg[dispNum[5]];
-  dispNum[4] = currentTime.separate.hour1; targetSegs[4] = convNumToSeg[dispNum[4]] | SEG_DOT;
-  dispNum[3] = currentTime.separate.hour2; targetSegs[3] = convNumToSeg[dispNum[3]];
-  dispNum[2] = 0; targetSegs[2] = 0x00;
-  dispNum[1] = currentTime.separate.day1;  targetSegs[1] = convNumToSeg[dispNum[1]];
-  dispNum[0] = currentTime.separate.day2;  targetSegs[0] = convNumToSeg[dispNum[0]];
+  if(displayShowMDHM){
+    // Month(2), Day(2), space, Hour(2), Min(2)
+    dispNum[0] = currentTime.separate.month2; targetSegs[0] = convNumToSeg[dispNum[0]];
+    dispNum[1] = currentTime.separate.month1; targetSegs[1] = convNumToSeg[dispNum[1]];
+    dispNum[2] = currentTime.separate.day2;   targetSegs[2] = convNumToSeg[dispNum[2]];
+    dispNum[3] = currentTime.separate.day1;   targetSegs[3] = convNumToSeg[dispNum[3]];
+    dispNum[4] = 0;                           targetSegs[4] = 0x00; // space
+    dispNum[5] = currentTime.separate.hour2;  targetSegs[5] = convNumToSeg[dispNum[5]];
+    dispNum[6] = currentTime.separate.hour1;  targetSegs[6] = convNumToSeg[dispNum[6]];
+    dispNum[7] = currentTime.separate.min2;   targetSegs[7] = convNumToSeg[dispNum[7]];
+    dispNum[8] = currentTime.separate.min1;   targetSegs[8] = convNumToSeg[dispNum[8]];
+  } else {
+    dispNum[8] = currentTime.separate.sec1;  targetSegs[8] = convNumToSeg[dispNum[8]];
+    dispNum[7] = currentTime.separate.sec2;  targetSegs[7] = convNumToSeg[dispNum[7]];
+    dispNum[6] = currentTime.separate.min1;  targetSegs[6] = convNumToSeg[dispNum[6]] | SEG_DOT;
+    dispNum[5] = currentTime.separate.min2;  targetSegs[5] = convNumToSeg[dispNum[5]];
+    dispNum[4] = currentTime.separate.hour1; targetSegs[4] = convNumToSeg[dispNum[4]] | SEG_DOT;
+    dispNum[3] = currentTime.separate.hour2; targetSegs[3] = convNumToSeg[dispNum[3]];
+    dispNum[2] = 0; targetSegs[2] = 0x00;
+    dispNum[1] = currentTime.separate.day1;  targetSegs[1] = convNumToSeg[dispNum[1]];
+    dispNum[0] = currentTime.separate.day2;  targetSegs[0] = convNumToSeg[dispNum[0]];
+  }
 
   // 1. 値が変化した時のトリガー処理
+  // NOTE: ドットは点滅用途で秒単位で変化するため、エフェクトトリガーの判定から除外する
   for (uint8_t i = 0; i < NUM_DIGITS; i++) {
-    if (targetSegs[i] != lastTargetSegs[i]) {
-      lastTargetSegs[i] = targetSegs[i]; 
+    uint16_t maskedNew = (uint16_t)(targetSegs[i] & ~SEG_DOT);
+    uint16_t maskedOld = (uint16_t)(lastTargetSegs[i] & ~SEG_DOT);
+    if (maskedNew != maskedOld) {
+      lastTargetSegs[i] = targetSegs[i];
 
       if (displayEffectMode == EFFECT_CUT) {
         previousSegs[i] = currentSegs[i];
@@ -590,6 +648,11 @@ void loop() {
   }
 
   renderDisplay();
+  // If alternate display active, blink the dot on hour ones digit (index 6)
+  if(displayShowMDHM){
+    if((currentTime.separate.sec1 & 0x1) == 0) currentSegs[6] |= SEG_DOT;
+    else currentSegs[6] &= ~SEG_DOT;
+  }
   updateDisplay();
 
   delay(20);

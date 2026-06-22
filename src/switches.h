@@ -15,3 +15,7 @@ void switches_register_callback(switch_cb_t cb);
 // debounced sample. Safe to call immediately after `switches_init()` to
 // detect power-on held buttons.
 bool switches_is_pressed(SwitchId id);
+
+// Read the physical pin state immediately (with pull-up) to detect a button
+// held at power-on. Returns true if pressed (LOW). Safe to call from setup().
+bool switches_was_held_at_boot(SwitchId id);

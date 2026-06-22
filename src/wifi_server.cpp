@@ -23,8 +23,12 @@ extern uint8_t dec2bcd(uint8_t val); // main.cpp に実装
 extern uint8_t displayEffectMode; // main.cpp にある表示モード変数
 extern uint32_t totalUptimeHours; // main.cpp にある累計時間
 extern SemaphoreHandle_t xPrefsMutex; // declared in main.cpp
+extern bool rtc_boot_ok; // main.cpp に追加した起動時 RTC 読み取りフラグ
 // forward declarations
 bool syncNTP();
+
+// 最終 NTP 同期時刻（UNIX epoch）。0=未同期
+static time_t last_ntp_sync = 0;
 
 void handleRoot() {
   extern const char* htmlPage;
@@ -96,6 +100,8 @@ void handleSyncTime(){
     rx8900_write_reg(0x0F, ctrl1 | 0x01);
     rx8900_write_reg(0x0F, ctrl1 & ~0x01);
     xSemaphoreGive(xWireMutex);
+    // 手動同期であれば最終同期時刻を更新
+    last_ntp_sync = time(NULL);
     server.send(200, "text/plain", "RTC updated");
   } else {
     server.send(500, "text/plain", "bus busy");
@@ -104,13 +110,23 @@ void handleSyncTime(){
 
 void handleStatus(){
   bool connected = (WiFi.status() == WL_CONNECTED);
-  String json = String("{") + "\"connected\":" + (connected?"true":"false") + "}";
+  String ipStr = "";
+  if(connected){ ipStr = WiFi.localIP().toString(); }
+  uint8_t apClients = WiFi.softAPgetStationNum();
+  unsigned long lastSync = (unsigned long)last_ntp_sync;
+  String json = String("{") +
+    "\"connected\":" + (connected?"true":"false") + "," +
+    "\"ip\":\"" + ipStr + "\"," +
+    "\"ap_clients\":" + String((int)apClients) + "," +
+    "\"last_sync\":" + String((unsigned long)lastSync) + "," +
+    "\"rtc_ok\":" + (rtc_boot_ok?"true":"false") +
+    "}";
   server.send(200, "application/json", json);
 }
 
 // Uptime handler
 void handleGetUptime(){
-  uint32_t h = totalUptimeHours;
+  uint32_t h = __atomic_load_n(&totalUptimeHours, __ATOMIC_SEQ_CST);
   String json = String("{") + "\"uptime_hours\":" + String((unsigned)h) + "}";
   server.send(200, "application/json", json);
 }
@@ -233,6 +249,8 @@ bool syncNTP() {
     rx8900_write_reg(0x0F, ctrl1 & ~0x01);
     xSemaphoreGive(xWireMutex);
     Serial.printf("RTC Perfectly Synced! Time: %02d:%02d:%02d\n", t_exact->tm_hour, t_exact->tm_min, t_exact->tm_sec);
+    // NTP による同期成功として時刻を記録
+    last_ntp_sync = time(NULL);
     return true;
   }
   return false;

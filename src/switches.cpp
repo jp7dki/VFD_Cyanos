@@ -65,3 +65,12 @@ bool switches_is_pressed(SwitchId id){
   if((int)id < 0 || (int)id >= 3) return false;
   return stable_state[(int)id];
 }
+
+bool switches_was_held_at_boot(SwitchId id){
+  if((int)id < 0 || (int)id >= 3) return false;
+  uint8_t pin = sw_pins[(int)id];
+  // Ensure input pull-up is active and read the raw pin once.
+  pinMode(pin, INPUT_PULLUP);
+  int v = digitalRead(pin);
+  return (v == LOW);
+}
