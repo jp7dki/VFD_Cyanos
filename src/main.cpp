@@ -200,6 +200,9 @@ const char* htmlPage = R"rawliteral(
       <input type="password" name="pass" placeholder="Password">
       <input name="ntp" placeholder="NTP servers (comma separated)">
       <button type="submit">Save & Restart</button>
+      <div style="height:8px"></div>
+      <button type="button" id="saveNtp">Save NTP (no restart)</button>
+      <div id="saveNtpResult" style="margin-top:8px;color:#060;min-height:18px"></div>
     </form>
   </div>
 
@@ -313,6 +316,20 @@ const char* htmlPage = R"rawliteral(
         }
       }catch(e){}
     }).catch(function(){});
+
+    // Save NTP (no restart) handler
+    var saveNtpBtn = document.getElementById('saveNtp');
+    var saveNtpRes = document.getElementById('saveNtpResult');
+    if(saveNtpBtn){
+      saveNtpBtn.addEventListener('click', function(){
+        var v = document.querySelector('input[name="ntp"]').value || '';
+        var body = 'ntp=' + encodeURIComponent(v);
+        fetch('/ntp', {method:'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: body})
+        .then(function(r){ return r.text(); })
+        .then(function(t){ saveNtpRes.innerText = t; })
+        .catch(function(){ saveNtpRes.innerText = 'Error saving NTP'; });
+      });
+    }
   </script>
 
 </body>
