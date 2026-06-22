@@ -29,6 +29,35 @@ bool syncNTP();
 
 // 最終 NTP 同期時刻（UNIX epoch）。0=未同期
 static time_t last_ntp_sync = 0;
+// NTP サーバ設定（カンマ区切りで複数可）。読み出しは WiFiTask 起動時に行う
+static String ntp_pref = String("pool.ntp.org");
+
+// GET /ntp -> {"ntp":"pool.ntp.org"}
+void handleGetNtp(){
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("wifi", true);
+  String v = preferences.getString("ntp", ntp_pref);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  String json = String("{") + "\"ntp\":\"" + v + "\"}";
+  server.send(200, "application/json", json);
+}
+
+// POST /ntp (form or body arg 'ntp') -> saves without restart
+void handleSetNtp(){
+  String v = server.arg("ntp");
+  if(v.length() == 0){
+    server.send(400, "text/plain", "ntp parameter required");
+    return;
+  }
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("wifi", false);
+  preferences.putString("ntp", v);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  ntp_pref = v;
+  server.send(200, "text/plain", "ntp saved");
+}
 
 void handleRoot() {
   extern const char* htmlPage;
@@ -50,11 +79,13 @@ void handleSave() {
 
   String newSSID = server.arg("ssid");
   String newPass = server.arg("pass");
+  String newNtp = server.arg("ntp");
 
   if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("wifi", false);
   preferences.putString("ssid", newSSID);
   preferences.putString("pass", newPass);
+  if(newNtp.length()>0) preferences.putString("ntp", newNtp);
   preferences.end();
   if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 
@@ -114,11 +145,19 @@ void handleStatus(){
   if(connected){ ipStr = WiFi.localIP().toString(); }
   uint8_t apClients = WiFi.softAPgetStationNum();
   unsigned long lastSync = (unsigned long)last_ntp_sync;
+  // read ntp pref for status
+  String ntp_show = ntp_pref;
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("wifi", true);
+  ntp_show = preferences.getString("ntp", ntp_show);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
   String json = String("{") +
     "\"connected\":" + (connected?"true":"false") + "," +
     "\"ip\":\"" + ipStr + "\"," +
     "\"ap_clients\":" + String((int)apClients) + "," +
     "\"last_sync\":" + String((unsigned long)lastSync) + "," +
+    "\"ntp\":\"" + ntp_show + "\"," +
     "\"rtc_ok\":" + (rtc_boot_ok?"true":"false") +
     "}";
   server.send(200, "application/json", json);
@@ -207,7 +246,24 @@ void handleSetMode(){
 }
 
 bool syncNTP() {
-  configTime(9 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  // Parse ntp_pref (comma separated) and call configTime with up to 3 servers
+  String list = ntp_pref;
+  if(list.length() == 0){ list = String("pool.ntp.org"); }
+  // split by comma
+  std::vector<String> servers;
+  int start = 0;
+  for(int i=0;i<=list.length();i++){
+    if(i==list.length() || list.charAt(i)==','){
+      String token = list.substring(start, i);
+      token.trim();
+      if(token.length()>0) servers.push_back(token);
+      start = i+1;
+    }
+  }
+  if(servers.size() == 0) servers.push_back(String("pool.ntp.org"));
+  if(servers.size() == 1) configTime(9 * 3600, 0, servers[0].c_str());
+  else if(servers.size() == 2) configTime(9 * 3600, 0, servers[0].c_str(), servers[1].c_str());
+  else configTime(9 * 3600, 0, servers[0].c_str(), servers[1].c_str(), servers[2].c_str());
   Serial.println("Waiting for NTP time sync...");
   struct tm timeinfo;
   bool syncSuccess = false;
@@ -285,6 +341,8 @@ void WiFiTask(void *pvParameters) {
   server.on("/uptime", HTTP_GET, handleGetUptime);
   server.on("/sync_time", HTTP_POST, handleSyncTime);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/ntp", HTTP_GET, handleGetNtp);
+  server.on("/ntp", HTTP_POST, handleSetNtp);
   server.on("/force_sync", HTTP_POST, handleForceSync);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -300,6 +358,13 @@ void WiFiTask(void *pvParameters) {
     Serial.println("No Router SSID set. Running in AP-Only mode.");
     forceSync = false;
   }
+
+  // Load NTP preference
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("wifi", true);
+  ntp_pref = preferences.getString("ntp", ntp_pref);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 
   while (1) {
     dnsServer.processNextRequest();
