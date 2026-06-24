@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/mcpwm.h"
+#include <SPI.h>
 
 volatile uint32_t bamBufferA[NUM_DIGITS][BAM_RESOLUTION];
 volatile uint32_t bamBufferB[NUM_DIGITS][BAM_RESOLUTION];
@@ -21,6 +22,14 @@ const uint16_t convNumToSeg[10] = {
 
 static uint8_t currentBrightness = 100; // fixed at 100% (0-100)
 static bool allowedLevel[101];
+// When true, ISR will drive zeros regardless of buffer contents so the
+// dynamic rendering can continue updating buffers while the visible
+// segments remain off to avoid residual images.
+static volatile bool display_blank_state = false;
+// Blink state for rightmost digit dot when blanking is active.
+static volatile bool display_blink_state = false;
+// Precomputed shift pattern for dot per digit to use from ISR.
+static uint32_t dotShift[NUM_DIGITS];
 
 static void compute_allowed_levels(){
   const uint8_t weights[BAM_RESOLUTION] = {1,2,4,8,16,32};
@@ -143,6 +152,16 @@ void IRAM_ATTR onBAMTimer(){
   ets_delay_us(2);
 
   uint32_t outData = activeBuffer[currentDigit][currentBit];
+  // If blanking is enabled, force no segments on to avoid residual images
+  // while keeping BAM/dynamic rendering running in the background.
+  if(display_blank_state){
+    // If blink is active and this is the rightmost digit, show only the dot.
+    if(display_blink_state && currentDigit == (NUM_DIGITS - 1)){
+      outData = dotShift[currentDigit];
+    } else {
+      outData = 0;
+    }
+  }
   GPIO.out_w1tc = (1 << VFD_RCLK_PIN);
   for (int8_t i = 23; i >= 0; i--) {
     if (outData & (1 << i)) {
@@ -206,4 +225,65 @@ void display_init(){
   // compute allowed levels before accepting brightness
   compute_allowed_levels();
   display_set_brightness(currentBrightness);
+
+  // Precompute shift patterns for the dot segment for each digit
+  for(int d=0; d<NUM_DIGITS; ++d) dotShift[d] = convShiftData((uint8_t)d, SEG_DOT);
+
+  // Start blink task to toggle the rightmost dot once per second while blanked
+  xTaskCreatePinnedToCore([](void* pv){
+    (void)pv;
+    for(;;){
+      if(display_blank_state) display_blink_state = !display_blink_state;
+      else display_blink_state = false;
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+  }, "DispBlink", 2048, NULL, 1, NULL, 1);
+}
+
+static bool display_enabled_state = true;
+// When true, ISR will drive zeros regardless of buffer contents so the
+// dynamic rendering can continue updating buffers while the visible
+// segments remain off to avoid residual images.
+bool display_set_enabled(bool enabled){
+  if(enabled == display_enabled_state) return display_enabled_state;
+  if(!enabled){
+    // Stop BAM ISR so we can safely drive the shift register directly
+    if(bam_timer) timerAlarmDisable(bam_timer);
+    // Ensure buffers contain zeros to avoid any residual data
+    memset((void*)bamBufferA, 0, sizeof(bamBufferA));
+    memset((void*)bamBufferB, 0, sizeof(bamBufferB));
+    // Drive shift registers with zeros and latch to turn off all segments.
+    // There are 24 bits per digit -> 3 bytes per digit. Shift zeros for all digits.
+    digitalWrite(VFD_RCLK_PIN, LOW);
+    SPI.begin();
+    SPI.beginTransaction(SPISettings(3000000, MSBFIRST, SPI_MODE0));
+    int totalBytes = NUM_DIGITS * 3;
+    for(int i = 0; i < totalBytes; ++i) SPI.transfer(0x00);
+    SPI.endTransaction();
+    digitalWrite(VFD_RCLK_PIN, HIGH);
+    // Turn off filaments
+    digitalWrite(VFD_FILAMENT1_PIN, LOW);
+    digitalWrite(VFD_FILAMENT2_PIN, LOW);
+  } else {
+    // Restore filaments and re-enable BAM timer
+    digitalWrite(VFD_FILAMENT1_PIN, HIGH);
+    digitalWrite(VFD_FILAMENT2_PIN, HIGH);
+    if(bam_timer) timerAlarmEnable(bam_timer);
+  }
+  display_enabled_state = enabled;
+  return display_enabled_state;
+}
+
+bool display_is_enabled(){
+  return display_enabled_state;
+}
+
+// Enable/disable blanking while keeping BAM/filament state as-is.
+bool display_set_blank(bool blank){
+  display_blank_state = blank;
+  return display_blank_state;
+}
+
+bool display_is_blank(){
+  return display_blank_state;
 }

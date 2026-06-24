@@ -29,6 +29,9 @@ extern hw_timer_t *bam_timer;
 extern const uint16_t convNumToSeg[10];
 
 void display_init();
+// enable/disable VFD display (filament + BAM timer). Returns new state.
+bool display_set_enabled(bool enabled);
+bool display_is_enabled();
 uint32_t convShiftData(uint8_t digit, uint16_t segment);
 void updateDisplay();
 // Set brightness as percent (0-100). Returns true if exact level applied,
@@ -37,4 +40,7 @@ bool display_set_brightness(uint8_t percent);
 uint8_t display_get_brightness();
 uint8_t display_get_bam_mask_for_digit(uint8_t digit);
 uint8_t display_get_bam_mask_for_percent(uint8_t percent);
+// Keep dynamic BAM running but force no segments on when blanking.
+bool display_set_blank(bool blank);
+bool display_is_blank();
  

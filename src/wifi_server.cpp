@@ -11,6 +11,29 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// Helper: civil/epoch conversions (Howard Hinnant algorithm)
+static int64_t days_from_civil(int y, unsigned m, unsigned d){
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y-399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d-1;
+  const unsigned doe = yoe*365 + yoe/4 - yoe/100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int &y, unsigned &m, unsigned &d){
+  z += 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = (unsigned)(z - era * 146097);
+  const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+  y = (int)(yoe) + (int)era * 400;
+  const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+  const unsigned mp = (5*doy + 2)/153;
+  d = doy - (153*mp+2)/5 + 1;
+  m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+}
+
 const byte DNS_PORT = 53;
 IPAddress apIP(192, 168, 4, 1);
 DNSServer dnsServer;
@@ -27,10 +50,17 @@ extern bool rtc_boot_ok; // main.cpp に追加した起動時 RTC 読み取り�
 // forward declarations
 bool syncNTP();
 
+// Auto on/off settings (defined in main.cpp)
+extern bool auto_enabled;
+extern uint16_t auto_on_minutes;  // minutes from 00:00
+extern uint16_t auto_off_minutes;
+
 // 最終 NTP 同期時刻（UNIX epoch）。0=未同期
 static time_t last_ntp_sync = 0;
 // NTP サーバ設定（カンマ区切りで複数可）。読み出しは WiFiTask 起動時に行う
 static String ntp_pref = String("pool.ntp.org");
+// timezone offset in minutes (e.g. JST = +540). persisted under NVS key "tzm" in "time" namespace
+int16_t tz_offset_minutes = 9 * 60; // default to JST
 
 // GET /ntp -> {"ntp":"pool.ntp.org"}
 void handleGetNtp(){
@@ -59,6 +89,74 @@ void handleSetNtp(){
   server.send(200, "text/plain", "ntp saved");
 }
 
+// GET /tz -> {"tz_min":540}
+void handleGetTz(){
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("time", true);
+  int v = preferences.getInt("tzm", tz_offset_minutes);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  String json = String("{") + "\"tz_min\":" + String((int)v) + "}";
+  server.send(200, "application/json", json);
+}
+
+// POST /tz (form arg 'tz' as minutes, e.g. 540) -> saves without restart
+void handleSetTz(){
+  String v = server.arg("tz");
+  if(v.length() == 0){
+    server.send(400, "text/plain", "tz parameter required (minutes)");
+    return;
+  }
+  int val = v.toInt();
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("time", false);
+  preferences.putInt("tzm", val);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  tz_offset_minutes = (int16_t)val;
+  server.send(200, "text/plain", "tz saved");
+}
+
+// GET /auto -> {"enabled":true,"on":420,"off":1380}
+void handleGetAuto(){
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("auto", true);
+  bool en = preferences.getBool("enabled", auto_enabled);
+  int onm = preferences.getInt("on", auto_on_minutes);
+  int ofm = preferences.getInt("off", auto_off_minutes);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  String json = String("{") + "\"enabled\":" + (en?"true":"false") + "," +
+    "\"on\":" + String(onm) + "," + "\"off\":" + String(ofm) + "}";
+  server.send(200, "application/json", json);
+}
+
+// POST /auto with form fields: enabled=on (checkbox), on=HH:MM, off=HH:MM
+void handleSetAuto(){
+  String en = server.arg("enabled");
+  String onv = server.arg("on");
+  String offv = server.arg("off");
+  bool newEn = (en.length()>0);
+  uint16_t onm = 0, offm = 0;
+  if(onv.length()>0){
+    int hh=0, mm=0; if(sscanf(onv.c_str(), "%d:%d", &hh, &mm) >= 1){ onm = (uint16_t)(hh*60 + mm); }
+  }
+  if(offv.length()>0){
+    int hh=0, mm=0; if(sscanf(offv.c_str(), "%d:%d", &hh, &mm) >= 1){ offm = (uint16_t)(hh*60 + mm); }
+  }
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("auto", false);
+  preferences.putBool("enabled", newEn);
+  preferences.putInt("on", onm);
+  preferences.putInt("off", offm);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  auto_enabled = newEn;
+  auto_on_minutes = onm;
+  auto_off_minutes = offm;
+  server.send(200, "text/plain", "auto saved");
+}
+
 void handleRoot() {
   extern const char* htmlPage;
   server.send(200, "text/html", htmlPage);
@@ -80,6 +178,10 @@ void handleSave() {
   String newSSID = server.arg("ssid");
   String newPass = server.arg("pass");
   String newNtp = server.arg("ntp");
+  String newTz = server.arg("tz");
+  String newAutoEnabled = server.arg("auto_enabled");
+  String newAutoOn = server.arg("auto_on");
+  String newAutoOff = server.arg("auto_off");
 
   if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("wifi", false);
@@ -88,6 +190,33 @@ void handleSave() {
   if(newNtp.length()>0) preferences.putString("ntp", newNtp);
   preferences.end();
   if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+
+  if(newTz.length() > 0){
+    int tzv = newTz.toInt();
+    if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+    preferences.begin("time", false);
+    preferences.putInt("tzm", tzv);
+    preferences.end();
+    if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+    tz_offset_minutes = (int16_t)tzv;
+  }
+  if(newAutoEnabled.length()>0 || newAutoOn.length()>0 || newAutoOff.length()>0){
+    bool nEn = (newAutoEnabled.length()>0);
+    uint16_t onm = auto_on_minutes;
+    uint16_t ofm = auto_off_minutes;
+    if(newAutoOn.length()>0){ int hh,mm; if(sscanf(newAutoOn.c_str(), "%d:%d", &hh,&mm)>=1) onm = hh*60+mm; }
+    if(newAutoOff.length()>0){ int hh,mm; if(sscanf(newAutoOff.c_str(), "%d:%d", &hh,&mm)>=1) ofm = hh*60+mm; }
+    if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+    preferences.begin("auto", false);
+    preferences.putBool("enabled", nEn);
+    preferences.putInt("on", onm);
+    preferences.putInt("off", ofm);
+    preferences.end();
+    if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+    auto_enabled = nEn;
+    auto_on_minutes = onm;
+    auto_off_minutes = ofm;
+  }
 
 
   server.send(200, "text/html", "<h2>Saved! Restarting...</h2>");
@@ -114,14 +243,32 @@ void handleSyncTime(){
     return;
   }
 
+  // Convert received client local time -> UTC epoch, then store UTC in RTC
+  int64_t days = days_from_civil(yr, (unsigned)mo, (unsigned)da);
+  int64_t epoch = days * 86400 + (int64_t)hh * 3600 + (int64_t)mi * 60 + (int64_t)se;
+  // Subtract configured timezone offset (minutes) to get UTC
+  epoch -= (int64_t)tz_offset_minutes * 60;
+  // Decompose back to components (UTC)
+  int y2; unsigned m2, d2;
+  int64_t days2 = epoch / 86400;
+  int64_t secs_of_day = epoch % 86400;
+  if(secs_of_day < 0){ secs_of_day += 86400; days2 -= 1; }
+  civil_from_days(days2, y2, m2, d2);
+  unsigned hh2 = (unsigned)(secs_of_day / 3600);
+  unsigned mm2 = (unsigned)((secs_of_day % 3600) / 60);
+  unsigned ss2 = (unsigned)(secs_of_day % 60);
+
   rtc_time t;
-  t.bcd.year = dec2bcd((uint8_t)(yr - 2000));
-  t.bcd.month = dec2bcd((uint8_t)mo);
-  t.bcd.day = dec2bcd((uint8_t)da);
-  t.bcd.weekday = 1 << (wd & 0x07);
-  t.bcd.hour = dec2bcd((uint8_t)hh);
-  t.bcd.min = dec2bcd((uint8_t)mi);
-  t.bcd.sec = dec2bcd((uint8_t)se);
+  t.bcd.year = dec2bcd((uint8_t)(y2 - 2000));
+  t.bcd.month = dec2bcd((uint8_t)m2);
+  t.bcd.day = dec2bcd((uint8_t)d2);
+  // weekday: compute from days2 (1970-01-01 was Thu=4)
+  int wday2 = (int)((4 + days2) % 7);
+  if(wday2 < 0) wday2 += 7;
+  t.bcd.weekday = 1 << (wday2 & 0x07);
+  t.bcd.hour = dec2bcd((uint8_t)hh2);
+  t.bcd.min = dec2bcd((uint8_t)mm2);
+  t.bcd.sec = dec2bcd((uint8_t)ss2);
 
   extern SemaphoreHandle_t xWireMutex;
   if(xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(2000)) == pdTRUE){
@@ -261,9 +408,10 @@ bool syncNTP() {
     }
   }
   if(servers.size() == 0) servers.push_back(String("pool.ntp.org"));
-  if(servers.size() == 1) configTime(9 * 3600, 0, servers[0].c_str());
-  else if(servers.size() == 2) configTime(9 * 3600, 0, servers[0].c_str(), servers[1].c_str());
-  else configTime(9 * 3600, 0, servers[0].c_str(), servers[1].c_str(), servers[2].c_str());
+  // Configure system time in UTC (0 offset). RTC will be written in UTC.
+  if(servers.size() == 1) configTime(0, 0, servers[0].c_str());
+  else if(servers.size() == 2) configTime(0, 0, servers[0].c_str(), servers[1].c_str());
+  else configTime(0, 0, servers[0].c_str(), servers[1].c_str(), servers[2].c_str());
   Serial.println("Waiting for NTP time sync...");
   struct tm timeinfo;
   bool syncSuccess = false;
@@ -285,7 +433,8 @@ bool syncNTP() {
   uint32_t wait_ms = 1000 - current_ms;
   vTaskDelay(pdMS_TO_TICKS(wait_ms));
   time_t now = tv.tv_sec + 1;
-  struct tm *t_exact = localtime(&now);
+  // Use UTC (gmtime) so RTC stores UTC
+  struct tm *t_exact = gmtime(&now);
 
   rtc_time t;
   t.bcd.year    = dec2bcd(t_exact->tm_year - 100);
@@ -343,6 +492,10 @@ void WiFiTask(void *pvParameters) {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/ntp", HTTP_GET, handleGetNtp);
   server.on("/ntp", HTTP_POST, handleSetNtp);
+  server.on("/tz", HTTP_GET, handleGetTz);
+  server.on("/tz", HTTP_POST, handleSetTz);
+  server.on("/auto", HTTP_GET, handleGetAuto);
+  server.on("/auto", HTTP_POST, handleSetAuto);
   server.on("/force_sync", HTTP_POST, handleForceSync);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -363,6 +516,13 @@ void WiFiTask(void *pvParameters) {
   if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
   preferences.begin("wifi", true);
   ntp_pref = preferences.getString("ntp", ntp_pref);
+  preferences.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+
+  // Load timezone preference (minutes offset). Stored in "time" namespace as int "tzm"
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  preferences.begin("time", true);
+  tz_offset_minutes = preferences.getInt("tzm", tz_offset_minutes);
   preferences.end();
   if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
 

@@ -85,6 +85,13 @@ volatile bool displayModeDirty = false;
 // If true, show Month(2)-Day(2)-space-Hour(2)-Min(2) layout instead of default
 bool displayShowMDHM = false;
 
+// Auto on/off config loaded from Preferences (also updated by wifi_server endpoints)
+bool auto_enabled = false;
+uint16_t auto_on_minutes = 0;
+uint16_t auto_off_minutes = 0;
+
+static bool last_display_state = true;
+
 // クロスフェード管理用変数
 uint16_t currentSegs[NUM_DIGITS]  = {0}; 
 uint16_t previousSegs[NUM_DIGITS] = {0}; 
@@ -103,6 +110,19 @@ void loadDisplayMode(){
     displayEffectMode = (uint8_t)m;
   }
   Serial.printf("loadDisplayMode: loaded mode=%u\n", (unsigned)displayEffectMode);
+}
+
+// Load persisted auto on/off settings
+void loadAutoSettings(){
+  Preferences p;
+  if(xPrefsMutex) xSemaphoreTake(xPrefsMutex, portMAX_DELAY);
+  p.begin("auto", true);
+  auto_enabled = p.getBool("enabled", false);
+  auto_on_minutes = (uint16_t)p.getInt("on", 0);
+  auto_off_minutes = (uint16_t)p.getInt("off", 0);
+  p.end();
+  if(xPrefsMutex) xSemaphoreGive(xPrefsMutex);
+  Serial.printf("loadAutoSettings: enabled=%d on=%u off=%u\n", (int)auto_enabled, (unsigned)auto_on_minutes, (unsigned)auto_off_minutes);
 }
 
 // PrefsTask: centralizes NVS writes to avoid concurrent Preferences access
@@ -129,6 +149,11 @@ void PrefsTask(void *pvParameters){
 
 // Switch handling: SWB cycles display effect mode when pressed.
 void switch_handler(SwitchId id, bool pressed){
+  // Ignore switch actions while display is blanked (off period).
+  if(display_is_blank()){
+    Serial.println("switch_handler: ignored while display blanked");
+    return;
+  }
   if(id == SW_B && pressed){
     uint8_t newMode = (displayEffectMode + 1) % 5;
     displayEffectMode = newMode;
@@ -173,6 +198,33 @@ uint8_t dec2bcd(uint8_t val){
   return ((val / 10) << 4) | (val % 10);
 }
 
+uint8_t bcd2dec(uint8_t b){
+  return (uint8_t)(((b >> 4) * 10) + (b & 0x0F));
+}
+
+// date <-> days conversion (civil) (algorithm by Howard Hinnant)
+static int64_t days_from_civil(int y, unsigned m, unsigned d){
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y-399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153*(m + (m > 2 ? -3 : 9)) + 2)/5 + d-1;
+  const unsigned doe = yoe*365 + yoe/4 - yoe/100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int &y, unsigned &m, unsigned &d){
+  z += 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = (unsigned)(z - era * 146097);
+  const unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+  y = (int)(yoe) + (int)era * 400;
+  const unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+  const unsigned mp = (5*doy + 2)/153;
+  d = doy - (153*mp+2)/5 + 1;
+  m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+}
+
 // Captive Portal & 管理ページ
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
@@ -199,9 +251,47 @@ const char* htmlPage = R"rawliteral(
       <input name="ssid" placeholder="WiFi SSID" required>
       <input type="password" name="pass" placeholder="Password">
       <input name="ntp" placeholder="NTP servers (comma separated)">
+      <label for="tz">Timezone</label>
+      <select name="tz" id="tz" style="width:100%">
+        <option value="-720">UTC-12</option>
+        <option value="-660">UTC-11</option>
+        <option value="-600">UTC-10 (HST)</option>
+        <option value="-540">UTC-9</option>
+        <option value="-480">UTC-8 (PST)</option>
+        <option value="-420">UTC-7 (MST)</option>
+        <option value="-360">UTC-6 (CST)</option>
+        <option value="-300">UTC-5 (EST)</option>
+        <option value="-240">UTC-4</option>
+        <option value="-180">UTC-3</option>
+        <option value="-120">UTC-2</option>
+        <option value="-60">UTC-1</option>
+        <option value="0">UTC</option>
+        <option value="60">UTC+1 (CET)</option>
+        <option value="120">UTC+2 (EET)</option>
+        <option value="180">UTC+3 (MSK)</option>
+        <option value="210">UTC+3:30</option>
+        <option value="240">UTC+4</option>
+        <option value="270">UTC+4:30</option>
+        <option value="300">UTC+5</option>
+        <option value="330">UTC+5:30 (IST)</option>
+        <option value="345">UTC+5:45 (NPT)</option>
+        <option value="360">UTC+6</option>
+        <option value="390">UTC+6:30</option>
+        <option value="420">UTC+7</option>
+        <option value="480">UTC+8</option>
+        <option value="525">UTC+8:45</option>
+        <option value="540" selected>UTC+9 (JST)</option>
+        <option value="570">UTC+9:30</option>
+        <option value="600">UTC+10</option>
+        <option value="660">UTC+11</option>
+        <option value="720">UTC+12</option>
+      </select>
       <button type="submit">Save & Restart</button>
       <div style="height:8px"></div>
       <button type="button" id="saveNtp">Save NTP (no restart)</button>
+      <div style="height:8px"></div>
+      <button type="button" id="saveTz">Save Timezone (no restart)</button>
+      <div id="saveTzResult" style="margin-top:8px;color:#060;min-height:18px"></div>
       <div id="saveNtpResult" style="margin-top:8px;color:#060;min-height:18px"></div>
     </form>
   </div>
@@ -230,6 +320,19 @@ const char* htmlPage = R"rawliteral(
     <div id="forceResult" style="margin-top:8px;color:#060;min-height:18px"></div>
   </div>
   
+  <div class="card">
+    <h2>Auto On/Off</h2>
+    <label><input type="checkbox" id="autoEnabled"> Enable Auto On/Off</label>
+    <div style="height:8px"></div>
+    <label for="autoOn">Auto On (HH:MM)</label>
+    <input type="time" id="autoOn" name="auto_on">
+    <label for="autoOff">Auto Off (HH:MM)</label>
+    <input type="time" id="autoOff" name="auto_off">
+    <div style="height:8px"></div>
+    <button id="saveAuto">Save Auto Settings</button>
+    <div id="saveAutoResult" style="margin-top:8px;color:#060;min-height:18px"></div>
+  </div>
+
     <div class="card">
       <h2>Device Status</h2>
       <div id="statusConnected" style="margin-bottom:6px">Connected: -</div>
@@ -317,6 +420,16 @@ const char* htmlPage = R"rawliteral(
       }catch(e){}
     }).catch(function(){});
 
+    // Prefill timezone select with current setting
+    fetch('/tz').then(function(r){ return r.json(); }).then(function(js){
+      try{
+        if(typeof js.tz_min !== 'undefined'){
+          var el = document.querySelector('select[name="tz"]');
+          if(el) el.value = js.tz_min;
+        }
+      }catch(e){}
+    }).catch(function(){});
+
     // Save NTP (no restart) handler
     var saveNtpBtn = document.getElementById('saveNtp');
     var saveNtpRes = document.getElementById('saveNtpResult');
@@ -328,6 +441,54 @@ const char* htmlPage = R"rawliteral(
         .then(function(r){ return r.text(); })
         .then(function(t){ saveNtpRes.innerText = t; })
         .catch(function(){ saveNtpRes.innerText = 'Error saving NTP'; });
+      });
+    }
+
+    var saveTzBtn = document.getElementById('saveTz');
+    var saveTzRes = document.getElementById('saveTzResult');
+    if(saveTzBtn){
+      saveTzBtn.addEventListener('click', function(){
+        var el = document.querySelector('select[name="tz"]');
+        var v = el ? el.value : '';
+        var body = 'tz=' + encodeURIComponent(v);
+        fetch('/tz', {method:'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: body})
+        .then(function(r){ return r.text(); })
+        .then(function(t){ saveTzRes.innerText = t; })
+        .catch(function(){ saveTzRes.innerText = 'Error saving TZ'; });
+      });
+    }
+
+    // Prefill Auto On/Off
+    fetch('/auto').then(function(r){ return r.json(); }).then(function(js){
+      try{
+        var cb = document.getElementById('autoEnabled');
+        var onEl = document.getElementById('autoOn');
+        var offEl = document.getElementById('autoOff');
+        if(cb) cb.checked = !!js.enabled;
+        if(typeof js.on !== 'undefined' && onEl){
+          var hh = Math.floor(js.on/60); var mm = js.on % 60;
+          onEl.value = (('0'+hh).slice(-2))+ ':' + (('0'+mm).slice(-2));
+        }
+        if(typeof js.off !== 'undefined' && offEl){
+          var hh = Math.floor(js.off/60); var mm = js.off % 60;
+          offEl.value = (('0'+hh).slice(-2))+ ':' + (('0'+mm).slice(-2));
+        }
+      }catch(e){}
+    }).catch(function(){});
+
+    var saveAutoBtn = document.getElementById('saveAuto');
+    var saveAutoRes = document.getElementById('saveAutoResult');
+    if(saveAutoBtn){
+      saveAutoBtn.addEventListener('click', function(){
+        var cb = document.getElementById('autoEnabled');
+        var onEl = document.getElementById('autoOn');
+        var offEl = document.getElementById('autoOff');
+        var body = '';
+        if(cb && cb.checked) body += 'enabled=1&';
+        if(onEl && onEl.value) body += 'on=' + encodeURIComponent(onEl.value) + '&';
+        if(offEl && offEl.value) body += 'off=' + encodeURIComponent(offEl.value) + '&';
+        fetch('/auto', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body: body})
+        .then(function(r){ return r.text(); }).then(function(t){ saveAutoRes.innerText = t; }).catch(function(){ saveAutoRes.innerText = 'Error saving Auto'; });
       });
     }
   </script>
@@ -424,18 +585,56 @@ void renderDisplay() {
 }
 
 void ClockTask(void *pvParameters){
-    while(1){
-      if(xSemaphoreTake(xIntMutex, portMAX_DELAY) == pdTRUE){
-          if(xSemaphoreTake(xWireMutex, portMAX_DELAY) == pdTRUE){
-              rx8900_get_time(&currentTime);
-              uint8_t flagReg = 0;
-              rx8900_read_reg(0x0E, &flagReg);
-              flagReg &= ~0x20; 
-              rx8900_write_reg(0x0E, flagReg);
-              xSemaphoreGive(xWireMutex);
-          }
+  while(1){
+    if(xSemaphoreTake(xIntMutex, portMAX_DELAY) == pdTRUE){
+      if(xSemaphoreTake(xWireMutex, portMAX_DELAY) == pdTRUE){
+        // Read raw RTC time (BCD)
+        rx8900_get_time(&currentTime);
+        uint8_t flagReg = 0;
+        rx8900_read_reg(0x0E, &flagReg);
+        flagReg &= ~0x20; 
+        rx8900_write_reg(0x0E, flagReg);
+
+        // Apply timezone offset (tz_offset_minutes) to produce local displayed time.
+        // Convert BCD->ymdhms, to epoch, add offset, convert back to components.
+        int yr = 2000 + bcd2dec(currentTime.bcd.year);
+        unsigned mo = bcd2dec(currentTime.bcd.month);
+        unsigned da = bcd2dec(currentTime.bcd.day);
+        unsigned hh = bcd2dec(currentTime.bcd.hour);
+        unsigned mm = bcd2dec(currentTime.bcd.min);
+        unsigned ss = bcd2dec(currentTime.bcd.sec);
+
+        int64_t days = days_from_civil(yr, mo, da);
+        int64_t epoch = days * 86400 + (int64_t)hh*3600 + (int64_t)mm*60 + (int64_t)ss;
+        epoch += (int64_t)tz_offset_minutes * 60; // apply offset
+
+        // Decompose epoch back to y/m/d/h/m/s
+        int yy; unsigned mmn, dd;
+        int64_t days2 = epoch / 86400;
+        int64_t secs_of_day = epoch % 86400;
+        if(secs_of_day < 0){ secs_of_day += 86400; days2 -= 1; }
+        civil_from_days(days2, yy, mmn, dd);
+        unsigned h2 = (unsigned)(secs_of_day / 3600);
+        unsigned m2 = (unsigned)((secs_of_day % 3600) / 60);
+        unsigned s2 = (unsigned)(secs_of_day % 60);
+
+        // Store back into currentTime as BCD
+        currentTime.bcd.year = dec2bcd((uint8_t)(yy - 2000));
+        currentTime.bcd.month = dec2bcd((uint8_t)mmn);
+        currentTime.bcd.day = dec2bcd((uint8_t)dd);
+        // weekday is bitmask in RTC; compute tm_wday (0=Sun)
+        // compute weekday via epoch mod 7: 1970-01-01 was Thu (4)
+        int wday = (int)((4 + days2) % 7);
+        if(wday < 0) wday += 7;
+        currentTime.bcd.weekday = 1 << (wday & 0x07);
+        currentTime.bcd.hour = dec2bcd((uint8_t)h2);
+        currentTime.bcd.min = dec2bcd((uint8_t)m2);
+        currentTime.bcd.sec = dec2bcd((uint8_t)s2);
+
+        xSemaphoreGive(xWireMutex);
       }
     }
+  }
 }
 
 void IRAM_ATTR handleRtcInterrupt(){
@@ -494,6 +693,8 @@ void setup() {
 
   // load persisted uptime hours and start uptime task
   loadUptimeHours();
+  // load auto on/off settings
+  loadAutoSettings();
   // Increase stack for UptimeTask to avoid overflow during NVS/Preferences operations
   xTaskCreatePinnedToCore(UptimeTask, "UptimeTask", 1024*2, NULL, 1, NULL, 1);
 }
@@ -682,6 +883,37 @@ void loop() {
     else currentSegs[6] &= ~SEG_DOT;
   }
   updateDisplay();
+
+  // Auto on/off enforcement: currentTime is already adjusted to tz in ClockTask
+  if(auto_enabled){
+    uint8_t ch = bcd2dec(currentTime.bcd.hour);
+    uint8_t cm = bcd2dec(currentTime.bcd.min);
+    uint16_t minutes = (uint16_t)ch * 60 + (uint16_t)cm;
+    bool shouldShow;
+    if(auto_on_minutes == auto_off_minutes){
+      shouldShow = true; // degenerate -> always on
+    } else if(auto_on_minutes < auto_off_minutes){
+      shouldShow = (minutes >= auto_on_minutes && minutes < auto_off_minutes);
+    } else {
+      // wrap around midnight
+      shouldShow = (minutes >= auto_on_minutes || minutes < auto_off_minutes);
+    }
+    if(shouldShow != last_display_state){
+      if(shouldShow){
+        // Make display visible again
+        display_set_blank(false);
+        display_set_enabled(true);
+      } else {
+        // Keep BAM running, but force blanking so nothing is visible
+        display_set_blank(true);
+        // Ensure display remains enabled so dynamic rendering continues
+        display_set_enabled(true);
+      }
+      last_display_state = shouldShow;
+    }
+  } else {
+    if(!last_display_state){ display_set_blank(false); display_set_enabled(true); last_display_state = true; }
+  }
 
   delay(20);
   dispCount++;
